@@ -9,7 +9,10 @@ import type {
 } from './types';
 
 export class ApiError extends Error {
-  constructor(public readonly command: string, message: string) {
+  constructor(
+    public readonly command: string,
+    message: string,
+  ) {
     super(`[${command}] ${message}`);
     this.name = 'ApiError';
   }
@@ -29,7 +32,7 @@ export async function healthCheck(): Promise<string> {
 
 export async function createIngestionTask(
   inputText: string,
-  taskType: string = 'text'
+  taskType: string = 'text',
 ): Promise<string> {
   return call<string>('create_ingestion_task', { inputText, taskType });
 }
@@ -37,14 +40,14 @@ export async function createIngestionTask(
 export async function saveAiResult(
   taskId: string,
   inputText: string,
-  aiOutput: AiResult
+  aiOutput: AiResult,
 ): Promise<void> {
   await call<void>('save_ai_result', { taskId, inputText, aiOutput });
 }
 
 export async function listIngestionTasks(
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
 ): Promise<IngestionTaskRow[]> {
   return call<IngestionTaskRow[]>('list_ingestion_tasks', { limit, offset });
 }

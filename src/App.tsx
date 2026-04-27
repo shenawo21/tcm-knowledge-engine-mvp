@@ -7,7 +7,13 @@ import { ReviewPage } from './pages/ReviewPage';
 import { ModelSettingsPage } from './pages/ModelSettingsPage';
 import { Sidebar } from './components/Sidebar';
 
-export type PageKey = 'dashboard' | 'ingestion' | 'review' | 'knowledge' | 'graph' | 'model-settings';
+export type PageKey =
+  | 'dashboard'
+  | 'ingestion'
+  | 'review'
+  | 'knowledge'
+  | 'graph'
+  | 'model-settings';
 
 export default function App() {
   const [page, setPage] = useState<PageKey>('dashboard');

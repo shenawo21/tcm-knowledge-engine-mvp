@@ -11,8 +11,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let _ = dotenvy::dotenv();
-            let state = db::init(app.handle())
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let state =
+                db::init(app.handle()).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             app.manage(state);
             Ok(())
         })

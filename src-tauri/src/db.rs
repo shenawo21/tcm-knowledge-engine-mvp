@@ -15,8 +15,7 @@ pub fn init(app: &AppHandle) -> Result<AppState, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("resolve app_data_dir failed: {e}"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create app_data_dir failed: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create app_data_dir failed: {e}"))?;
     let db_path = dir.join("tcm-knowledge-engine.sqlite");
 
     let conn = Connection::open(&db_path)

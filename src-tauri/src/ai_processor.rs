@@ -41,7 +41,10 @@ Confidence values must be between 0.0 and 1.0.
 Return ONLY valid JSON. No explanation, no markdown wrapping."#;
 
 /// Primary AI processing — DB config takes priority, falls back to env vars.
-pub async fn process(input_text: &str, config: Option<AiModelConfigRow>) -> Result<AiResult, String> {
+pub async fn process(
+    input_text: &str,
+    config: Option<AiModelConfigRow>,
+) -> Result<AiResult, String> {
     let (api_key, base_url, model_name, api_type) = resolve_credentials(config)?;
     make_ai_request(input_text, &api_key, &base_url, &model_name, &api_type).await
 }
@@ -108,16 +111,13 @@ fn resolve_credentials(
     if let Some(c) = config {
         let api_key = c.api_key.trim().to_string();
         if api_key.is_empty() {
-            return Err(
-                "已激活模型配置中的 API Key 为空，请在模型设置页更新。".to_string()
-            );
+            return Err("已激活模型配置中的 API Key 为空，请在模型设置页更新。".to_string());
         }
         return Ok((api_key, c.base_url, c.model_name, c.api_type));
     }
     // Fallback to env vars (backwards-compat with .env / OPENAI_API_KEY)
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
-        "未配置可用模型，请先到「模型设置」页添加配置并设为激活。".to_string()
-    })?;
+    let api_key = env::var("OPENAI_API_KEY")
+        .map_err(|_| "未配置可用模型，请先到「模型设置」页添加配置并设为激活。".to_string())?;
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
         return Err("OPENAI_API_KEY 环境变量为空，请检查配置。".to_string());
@@ -136,7 +136,11 @@ fn build_client() -> Result<Client, String> {
 
 fn build_endpoint_url(base_url: &str, api_type: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let path = if api_type == "responses" { "responses" } else { "chat/completions" };
+    let path = if api_type == "responses" {
+        "responses"
+    } else {
+        "chat/completions"
+    };
     if base.ends_with("/v1") {
         format!("{}/{}", base, path)
     } else {

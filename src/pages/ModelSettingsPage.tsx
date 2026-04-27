@@ -131,8 +131,8 @@ export function ModelSettingsPage() {
         {activeConfig ? (
           <p>
             <b>{activeConfig.providerName}</b>&nbsp;/&nbsp;{activeConfig.modelName}
-            &nbsp;({activeConfig.apiType})&nbsp;&nbsp;
-            Key:&nbsp;<code>{activeConfig.maskedApiKey}</code>
+            &nbsp;({activeConfig.apiType})&nbsp;&nbsp; Key:&nbsp;
+            <code>{activeConfig.maskedApiKey}</code>
           </p>
         ) : (
           <p>暂无激活模型，请在下方添加配置并点击「设为当前」。</p>
@@ -184,11 +184,7 @@ export function ModelSettingsPage() {
             </label>
             <label>
               API 类型
-              <select
-                value={form.apiType}
-                onChange={field('apiType')}
-                disabled={saving}
-              >
+              <select value={form.apiType} onChange={field('apiType')} disabled={saving}>
                 <option value="chat_completions">chat_completions</option>
                 <option value="responses">responses</option>
               </select>

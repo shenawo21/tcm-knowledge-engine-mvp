@@ -361,7 +361,14 @@ fn mask_api_key(key: &str) -> String {
         return "****".to_string();
     }
     let first: String = key.chars().take(3).collect();
-    let last: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let last: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{}****{}", first, last)
 }
 
@@ -456,7 +463,10 @@ pub fn get_active_ai_model(conn: &Connection) -> rusqlite::Result<Option<AiModel
 
 pub fn get_active_ai_model_full(conn: &Connection) -> rusqlite::Result<Option<AiModelConfigRow>> {
     conn.query_row(
-        &format!("{} FROM ai_model_config WHERE is_active = 1 LIMIT 1", CONFIG_SELECT),
+        &format!(
+            "{} FROM ai_model_config WHERE is_active = 1 LIMIT 1",
+            CONFIG_SELECT
+        ),
         [],
         map_config_row,
     )

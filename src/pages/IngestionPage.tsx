@@ -60,9 +60,7 @@ export function IngestionPage() {
         {status.kind === 'done' && (
           <p>已写入数据库（task = {status.taskId}）。切到「知识库」页查看。</p>
         )}
-        {status.kind === 'error' && (
-          <p style={{ color: 'crimson' }}>错误：{status.message}</p>
-        )}
+        {status.kind === 'error' && <p style={{ color: 'crimson' }}>错误：{status.message}</p>}
       </div>
 
       {result && (

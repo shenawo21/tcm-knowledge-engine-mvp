@@ -2,7 +2,10 @@ use tauri::State;
 
 use crate::ai_processor;
 use crate::db::AppState;
-use crate::models::{AiModelConfigView, AiResult, EntityDetail, EntityListItem, IngestionTaskRow, TestConnectionResult};
+use crate::models::{
+    AiModelConfigView, AiResult, EntityDetail, EntityListItem, IngestionTaskRow,
+    TestConnectionResult,
+};
 use crate::repository;
 
 fn lock_err(e: impl std::fmt::Display) -> String {
@@ -124,12 +127,22 @@ pub fn save_ai_model_config(
     let model_name = model_name.trim();
     let api_type = api_type.trim();
 
-    if provider_name.is_empty() { return Err("provider_name is required".into()); }
-    if base_url.is_empty() { return Err("base_url is required".into()); }
-    if api_key.is_empty() { return Err("api_key is required".into()); }
-    if model_name.is_empty() { return Err("model_name is required".into()); }
+    if provider_name.is_empty() {
+        return Err("provider_name is required".into());
+    }
+    if base_url.is_empty() {
+        return Err("base_url is required".into());
+    }
+    if api_key.is_empty() {
+        return Err("api_key is required".into());
+    }
+    if model_name.is_empty() {
+        return Err("model_name is required".into());
+    }
     if !["chat_completions", "responses"].contains(&api_type) {
-        return Err(format!("api_type must be chat_completions or responses, got: {api_type}"));
+        return Err(format!(
+            "api_type must be chat_completions or responses, got: {api_type}"
+        ));
     }
 
     let conn = state.db.lock().map_err(lock_err)?;
@@ -146,18 +159,13 @@ pub fn save_ai_model_config(
 }
 
 #[tauri::command]
-pub fn list_ai_model_configs(
-    state: State<'_, AppState>,
-) -> Result<Vec<AiModelConfigView>, String> {
+pub fn list_ai_model_configs(state: State<'_, AppState>) -> Result<Vec<AiModelConfigView>, String> {
     let conn = state.db.lock().map_err(lock_err)?;
     repository::list_ai_model_configs(&conn).map_err(db_err)
 }
 
 #[tauri::command]
-pub fn set_active_ai_model(
-    state: State<'_, AppState>,
-    config_id: String,
-) -> Result<bool, String> {
+pub fn set_active_ai_model(state: State<'_, AppState>, config_id: String) -> Result<bool, String> {
     if config_id.trim().is_empty() {
         return Err("config_id is required".into());
     }
