@@ -1,0 +1,476 @@
+use std::collections::HashMap;
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use uuid::Uuid;
+
+use crate::models::{
+    AiModelConfigRow, AiModelConfigView, AiResult, EntityDetail, EntityListItem, EntityRow,
+    IngestionTaskRow, RelationView,
+};
+
+const CONFIDENCE_THRESHOLD: f64 = 0.85;
+
+fn now_iso() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn new_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn create_ingestion_task(
+    conn: &Connection,
+    task_type: &str,
+    input_text: &str,
+) -> rusqlite::Result<String> {
+    let id = new_id();
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO ingestion_task (id, task_type, input_text, status, retry_count, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+        params![id, task_type, input_text, now],
+    )?;
+    Ok(id)
+}
+
+pub fn mark_task_failed(
+    conn: &Connection,
+    task_id: &str,
+    error_message: &str,
+) -> rusqlite::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "UPDATE ingestion_task SET status = 'failed', error_message = ?1, updated_at = ?2 WHERE id = ?3",
+        params![error_message, now, task_id],
+    )?;
+    Ok(())
+}
+
+pub fn save_ai_result(
+    conn: &mut Connection,
+    task_id: &str,
+    ai: &AiResult,
+    input_text: &str,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+
+    let source_id = insert_synthetic_source(&tx, input_text)?;
+
+    let mut name_to_id: HashMap<String, String> = HashMap::new();
+    for ent in &ai.entities {
+        let entity_id = upsert_entity(&tx, &ent.entity_type, &ent.name, ent.confidence)?;
+        name_to_id.insert(ent.name.clone(), entity_id.clone());
+
+        if let Some(c) = ent.confidence {
+            if c < CONFIDENCE_THRESHOLD {
+                insert_review_item(
+                    &tx,
+                    "entity",
+                    &entity_id,
+                    None,
+                    Some(&format!("low_confidence:{c:.2}")),
+                    None,
+                    None,
+                )?;
+            }
+        }
+    }
+
+    for rel in &ai.relations {
+        match (name_to_id.get(&rel.from), name_to_id.get(&rel.to)) {
+            (Some(from_id), Some(to_id)) => {
+                insert_relation(
+                    &tx,
+                    from_id,
+                    to_id,
+                    &rel.relation_type,
+                    Some(&source_id),
+                    rel.confidence,
+                )?;
+            }
+            _ => {
+                let pseudo_id = new_id();
+                let risk = serde_json::json!({
+                    "from": rel.from,
+                    "to": rel.to,
+                    "relation_type": rel.relation_type,
+                })
+                .to_string();
+                insert_review_item(
+                    &tx,
+                    "unresolved_relation",
+                    &pseudo_id,
+                    None,
+                    Some("entity_name_not_found_in_batch"),
+                    Some(&risk),
+                    None,
+                )?;
+            }
+        }
+    }
+
+    if let Some(review) = &ai.review {
+        if matches!(review.level.as_deref(), Some("B") | Some("C")) {
+            insert_review_item(
+                &tx,
+                "ingestion_task",
+                task_id,
+                review.level.as_deref(),
+                review.reason.as_deref(),
+                None,
+                review.decision.as_deref(),
+            )?;
+        }
+    }
+
+    let now = now_iso();
+    let content_type = ai.content_type.as_deref();
+    tx.execute(
+        "UPDATE ingestion_task
+         SET status = 'completed', source_id = ?1, content_type = ?2, updated_at = ?3
+         WHERE id = ?4",
+        params![source_id, content_type, now, task_id],
+    )?;
+
+    tx.commit()
+}
+
+fn insert_synthetic_source(tx: &Transaction, input_text: &str) -> rusqlite::Result<String> {
+    let id = new_id();
+    let title: String = input_text.chars().take(40).collect();
+    let title = if title.is_empty() {
+        "user_input".to_string()
+    } else {
+        title
+    };
+    let now = now_iso();
+    tx.execute(
+        "INSERT INTO source (id, title, source_type, created_at, updated_at)
+         VALUES (?1, ?2, 'user_input', ?3, ?3)",
+        params![id, title, now],
+    )?;
+    Ok(id)
+}
+
+fn upsert_entity(
+    tx: &Transaction,
+    entity_type: &str,
+    name: &str,
+    confidence: Option<f64>,
+) -> rusqlite::Result<String> {
+    let now = now_iso();
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT id FROM entity WHERE entity_type = ?1 AND name = ?2",
+            params![entity_type, name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+
+    if let Some(id) = existing {
+        tx.execute(
+            "UPDATE entity
+             SET source_count = source_count + 1,
+                 confidence = COALESCE(?1, confidence),
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![confidence, now, id],
+        )?;
+        Ok(id)
+    } else {
+        let id = new_id();
+        tx.execute(
+            "INSERT INTO entity (id, entity_type, name, confidence, source_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+            params![id, entity_type, name, confidence, now],
+        )?;
+        Ok(id)
+    }
+}
+
+fn insert_relation(
+    tx: &Transaction,
+    from_entity_id: &str,
+    to_entity_id: &str,
+    relation_type: &str,
+    source_id: Option<&str>,
+    confidence: Option<f64>,
+) -> rusqlite::Result<String> {
+    let id = new_id();
+    let now = now_iso();
+    tx.execute(
+        "INSERT INTO relation (id, from_entity_id, to_entity_id, relation_type, source_id, confidence, review_status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        params![id, from_entity_id, to_entity_id, relation_type, source_id, confidence, now],
+    )?;
+    Ok(id)
+}
+
+fn insert_review_item(
+    tx: &Transaction,
+    target_type: &str,
+    target_id: &str,
+    review_level: Option<&str>,
+    review_reason: Option<&str>,
+    risk_flags: Option<&str>,
+    decision: Option<&str>,
+) -> rusqlite::Result<()> {
+    let id = new_id();
+    let now = now_iso();
+    tx.execute(
+        "INSERT INTO review_item (id, target_type, target_id, review_level, review_reason, risk_flags, decision, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, target_type, target_id, review_level, review_reason, risk_flags, decision, now],
+    )?;
+    Ok(())
+}
+
+pub fn list_ingestion_tasks(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<IngestionTaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, task_type, input_text, status, content_type, source_id, error_message, created_at, updated_at
+         FROM ingestion_task
+         ORDER BY created_at DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |row| {
+        Ok(IngestionTaskRow {
+            id: row.get(0)?,
+            task_type: row.get(1)?,
+            input_text: row.get(2)?,
+            status: row.get(3)?,
+            content_type: row.get(4)?,
+            source_id: row.get(5)?,
+            error_message: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn list_entities(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<EntityListItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            e.id, e.entity_type, e.name, e.description, e.confidence, e.source_count, e.updated_at,
+            (SELECT COUNT(*) FROM relation r
+             WHERE r.from_entity_id = e.id OR r.to_entity_id = e.id) AS relations_count
+         FROM entity e
+         ORDER BY COALESCE(e.updated_at, e.created_at) DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(EntityListItem {
+            id: row.get(0)?,
+            entity_type: row.get(1)?,
+            name: row.get(2)?,
+            description: row.get(3)?,
+            confidence: row.get(4)?,
+            source_count: row.get(5)?,
+            updated_at: row.get(6)?,
+            relations_count: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn get_entity_detail(conn: &Connection, id: &str) -> rusqlite::Result<Option<EntityDetail>> {
+    let entity: Option<EntityRow> = conn
+        .query_row(
+            "SELECT id, entity_type, name, aliases, description, tcm_explanation, western_explanation,
+                    confidence, source_count, created_at, updated_at
+             FROM entity WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(EntityRow {
+                    id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    name: row.get(2)?,
+                    aliases: row.get(3)?,
+                    description: row.get(4)?,
+                    tcm_explanation: row.get(5)?,
+                    western_explanation: row.get(6)?,
+                    confidence: row.get(7)?,
+                    source_count: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(entity) = entity else {
+        return Ok(None);
+    };
+
+    let outgoing = list_relations_for(conn, id, true)?;
+    let incoming = list_relations_for(conn, id, false)?;
+
+    Ok(Some(EntityDetail {
+        entity,
+        outgoing,
+        incoming,
+    }))
+}
+
+fn list_relations_for(
+    conn: &Connection,
+    entity_id: &str,
+    outgoing: bool,
+) -> rusqlite::Result<Vec<RelationView>> {
+    let sql = if outgoing {
+        "SELECT r.id, r.from_entity_id, ef.name, r.to_entity_id, et.name, r.relation_type, r.confidence
+         FROM relation r
+         JOIN entity ef ON ef.id = r.from_entity_id
+         JOIN entity et ON et.id = r.to_entity_id
+         WHERE r.from_entity_id = ?1
+         ORDER BY r.created_at DESC"
+    } else {
+        "SELECT r.id, r.from_entity_id, ef.name, r.to_entity_id, et.name, r.relation_type, r.confidence
+         FROM relation r
+         JOIN entity ef ON ef.id = r.from_entity_id
+         JOIN entity et ON et.id = r.to_entity_id
+         WHERE r.to_entity_id = ?1
+         ORDER BY r.created_at DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![entity_id], |row| {
+        Ok(RelationView {
+            id: row.get(0)?,
+            from_entity_id: row.get(1)?,
+            from_name: row.get(2)?,
+            to_entity_id: row.get(3)?,
+            to_name: row.get(4)?,
+            relation_type: row.get(5)?,
+            confidence: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ─── ai_model_config ─────────────────────────────────────────────────────────
+
+fn mask_api_key(key: &str) -> String {
+    let key = key.trim();
+    let char_count = key.chars().count();
+    if char_count <= 8 {
+        return "****".to_string();
+    }
+    let first: String = key.chars().take(3).collect();
+    let last: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    format!("{}****{}", first, last)
+}
+
+fn to_config_view(row: AiModelConfigRow) -> AiModelConfigView {
+    AiModelConfigView {
+        masked_api_key: mask_api_key(&row.api_key),
+        id: row.id,
+        provider_name: row.provider_name,
+        base_url: row.base_url,
+        model_name: row.model_name,
+        api_type: row.api_type,
+        is_active: row.is_active,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+fn map_config_row(row: &rusqlite::Row) -> rusqlite::Result<AiModelConfigRow> {
+    Ok(AiModelConfigRow {
+        id: row.get(0)?,
+        provider_name: row.get(1)?,
+        base_url: row.get(2)?,
+        api_key: row.get(3)?,
+        model_name: row.get(4)?,
+        api_type: row.get(5)?,
+        is_active: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+const CONFIG_SELECT: &str =
+    "SELECT id, provider_name, base_url, api_key, model_name, api_type, is_active, created_at, updated_at";
+
+pub fn save_ai_model_config(
+    conn: &Connection,
+    id: Option<&str>,
+    provider_name: &str,
+    base_url: &str,
+    api_key: &str,
+    model_name: &str,
+    api_type: &str,
+) -> rusqlite::Result<String> {
+    let now = now_iso();
+    if let Some(existing_id) = id {
+        conn.execute(
+            "UPDATE ai_model_config
+             SET provider_name=?1, base_url=?2, api_key=?3, model_name=?4, api_type=?5, updated_at=?6
+             WHERE id=?7",
+            params![provider_name, base_url, api_key, model_name, api_type, now, existing_id],
+        )?;
+        Ok(existing_id.to_string())
+    } else {
+        let new_id_val = new_id();
+        conn.execute(
+            "INSERT INTO ai_model_config
+             (id, provider_name, base_url, api_key, model_name, api_type, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)",
+            params![new_id_val, provider_name, base_url, api_key, model_name, api_type, now],
+        )?;
+        Ok(new_id_val)
+    }
+}
+
+pub fn list_ai_model_configs(conn: &Connection) -> rusqlite::Result<Vec<AiModelConfigView>> {
+    let mut stmt = conn.prepare(&format!(
+        "{} FROM ai_model_config ORDER BY created_at DESC",
+        CONFIG_SELECT
+    ))?;
+    let rows = stmt.query_map([], map_config_row)?;
+    rows.map(|r| r.map(to_config_view)).collect()
+}
+
+pub fn set_active_ai_model(conn: &mut Connection, config_id: &str) -> rusqlite::Result<bool> {
+    let tx = conn.transaction()?;
+    let now = now_iso();
+    tx.execute(
+        "UPDATE ai_model_config SET is_active = 0, updated_at = ?1",
+        params![now],
+    )?;
+    let rows_affected = tx.execute(
+        "UPDATE ai_model_config SET is_active = 1, updated_at = ?1 WHERE id = ?2",
+        params![now, config_id],
+    )?;
+    tx.commit()?;
+    Ok(rows_affected > 0)
+}
+
+pub fn get_active_ai_model(conn: &Connection) -> rusqlite::Result<Option<AiModelConfigView>> {
+    get_active_ai_model_full(conn).map(|opt| opt.map(to_config_view))
+}
+
+pub fn get_active_ai_model_full(conn: &Connection) -> rusqlite::Result<Option<AiModelConfigRow>> {
+    conn.query_row(
+        &format!("{} FROM ai_model_config WHERE is_active = 1 LIMIT 1", CONFIG_SELECT),
+        [],
+        map_config_row,
+    )
+    .optional()
+}
+
+pub fn get_ai_model_config_by_id(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<AiModelConfigRow>> {
+    conn.query_row(
+        &format!("{} FROM ai_model_config WHERE id = ?1", CONFIG_SELECT),
+        params![id],
+        map_config_row,
+    )
+    .optional()
+}

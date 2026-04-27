@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+
+# Rust / Tauri
+target/
+src-tauri/gen/
+
+# SQLite database (contains user data and API keys at runtime)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Secrets — never commit
+.env
+
+# Claude Code local config
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
