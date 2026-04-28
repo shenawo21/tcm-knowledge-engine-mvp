@@ -15,8 +15,9 @@ src-tauri/gen/
 .env
 
 # Claude Code local config
-.claude/
 
 # OS
 .DS_Store
 Thumbs.db
+
+.claude/settings.local.json
