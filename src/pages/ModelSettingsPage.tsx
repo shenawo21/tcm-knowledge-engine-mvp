@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import {
+  getUsageSummary,
   listAiModelConfigs,
   saveAiModelConfig,
   setActiveAiModel,
   testAiModelConnection,
 } from '../lib/api';
-import type { AiModelConfigView, TestConnectionResult } from '../lib/types';
+import type { AiModelConfigView, TestConnectionResult, UsageSummary } from '../lib/types';
 
 type ApiType = 'chat_completions' | 'responses';
 
@@ -40,6 +41,9 @@ export function ModelSettingsPage() {
   const [settingActiveId, setSettingActiveId] = useState<string | null>(null);
   const [activeError, setActiveError] = useState<string | null>(null);
 
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+  const [usageError, setUsageError] = useState(false);
+
   const activeConfig = configs.find(c => c.isActive) ?? null;
 
   function field(key: keyof FormState) {
@@ -60,6 +64,9 @@ export function ModelSettingsPage() {
 
   useEffect(() => {
     loadConfigs();
+    getUsageSummary()
+      .then(setUsage)
+      .catch(() => setUsageError(true));
   }, []);
 
   async function handleSave(e: React.FormEvent) {
@@ -124,6 +131,23 @@ export function ModelSettingsPage() {
   return (
     <section>
       <h1>模型设置</h1>
+
+      {/* AI usage summary */}
+      <div className="panel">
+        <h2>AI 用量统计</h2>
+        {usageError ? (
+          <p style={{ color: 'var(--color-muted, #888)' }}>AI 用量统计暂不可用</p>
+        ) : usage === null ? (
+          <p style={{ color: 'var(--color-muted, #888)' }}>加载中…</p>
+        ) : (
+          <p>
+            本地记录累计消耗&nbsp;<b>${usage.totalCostUsd.toFixed(4)}</b>&nbsp;/&nbsp;$12.00
+            &nbsp;｜&nbsp;今日&nbsp;<b>${usage.todayCostUsd.toFixed(4)}</b>
+            &nbsp;｜&nbsp;总调用&nbsp;<b>{usage.totalCalls}</b>&nbsp;次
+            &nbsp;｜&nbsp;缓存命中&nbsp;<b>{usage.cacheHitCount}</b>&nbsp;次
+          </p>
+        )}
+      </div>
 
       {/* Active model */}
       <div className="panel">

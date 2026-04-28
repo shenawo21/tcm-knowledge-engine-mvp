@@ -4,7 +4,7 @@ use crate::ai_processor;
 use crate::db::AppState;
 use crate::models::{
     AiModelConfigView, AiResult, EntityDetail, EntityListItem, IngestionTaskRow,
-    TestConnectionResult,
+    TestConnectionResult, UsageSummary,
 };
 use crate::repository;
 
@@ -99,11 +99,13 @@ pub fn get_entity_detail(
 }
 
 /// process_with_ai: reads active model config from DB (falls back to env vars).
-/// Lock released before the async HTTP call to avoid holding MutexGuard across await.
+/// Checks exact-hash cache before calling API. Logs usage on every call.
+/// Lock released before async HTTP call to avoid holding MutexGuard across await.
 #[tauri::command]
 pub async fn process_with_ai(
     state: State<'_, AppState>,
     input_text: String,
+    prompt_type: Option<String>,
 ) -> Result<AiResult, String> {
     let trimmed = input_text.trim().to_string();
     if trimmed.is_empty() {
@@ -112,12 +114,88 @@ pub async fn process_with_ai(
     if trimmed.chars().count() > MAX_INPUT_TEXT_CHARS {
         return Err(format!("input_text exceeds {MAX_INPUT_TEXT_CHARS} characters").into());
     }
-    let config_opt = {
+    let pt = prompt_type.as_deref().unwrap_or("default");
+    let normalized = ai_processor::normalize_input(&trimmed);
+
+    let (config_opt, model_name, api_type_str) = {
         let conn = state.db.lock().map_err(lock_err)?;
-        repository::get_active_ai_model_full(&conn).map_err(db_err)?
+        let config = repository::get_active_ai_model_full(&conn).map_err(db_err)?;
         // MutexGuard dropped here
+        let (mn, at) = if let Some(ref c) = config {
+            (c.model_name.clone(), c.api_type.clone())
+        } else {
+            let mn = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            (mn, "chat_completions".to_string())
+        };
+        (config, mn, at)
     };
-    ai_processor::process(&trimmed, config_opt).await
+
+    let cache_key = ai_processor::compute_cache_key(
+        ai_processor::PROMPT_VERSION,
+        pt,
+        &model_name,
+        &api_type_str,
+        &normalized,
+    );
+
+    // Ensure tables exist on any pre-existing database before first access.
+    {
+        let conn = state.db.lock().map_err(lock_err)?;
+        repository::ensure_ai_cost_tables(&conn).map_err(db_err)?;
+    }
+
+    // Check exact cache (lock → query → release)
+    let cached = {
+        let conn = state.db.lock().map_err(lock_err)?;
+        repository::get_exact_cache(&conn, &cache_key).map_err(db_err)?
+    };
+
+    if let Some((cached_json, input_tokens, output_tokens)) = cached {
+        // If the stored JSON is corrupt, fall through to a fresh API call rather than erroring.
+        if let Ok(result) = serde_json::from_str::<AiResult>(&cached_json) {
+            if let Ok(conn) = state.db.lock() {
+                let _ = repository::log_ai_usage(
+                    &conn, &model_name, pt, input_tokens, output_tokens, 0.0, true,
+                );
+            }
+            return Ok(result);
+        }
+        // Corrupt cache entry — continue to API call below.
+    }
+
+    // Cache miss — call API (no lock held during await)
+    let (result, input_tokens, output_tokens) =
+        ai_processor::process(&trimmed, config_opt).await?;
+
+    // Write cache + log — failure here is non-fatal
+    if let Ok(conn) = state.db.lock() {
+        let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
+        if let Ok(json) = serde_json::to_string(&result) {
+            let _ = repository::save_exact_cache(
+                &conn,
+                &cache_key,
+                ai_processor::PROMPT_VERSION,
+                pt,
+                &api_type_str,
+                1200,
+                &model_name,
+                &json,
+                input_tokens,
+                output_tokens,
+            );
+        }
+        let _ = repository::log_ai_usage(
+            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
+        );
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn get_usage_summary(state: State<'_, AppState>) -> Result<UsageSummary, String> {
+    let conn = state.db.lock().map_err(lock_err)?;
+    repository::get_usage_summary(&conn).map_err(db_err)
 }
 
 // ─── model config commands ────────────────────────────────────────────────────

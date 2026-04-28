@@ -29,6 +29,7 @@ pub fn run() {
             commands::set_active_ai_model,
             commands::get_active_ai_model,
             commands::test_ai_model_connection,
+            commands::get_usage_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

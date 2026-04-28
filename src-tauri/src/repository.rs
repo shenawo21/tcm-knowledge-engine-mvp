@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::models::{
     AiModelConfigRow, AiModelConfigView, AiResult, EntityDetail, EntityListItem, EntityRow,
-    IngestionTaskRow, RelationView,
+    IngestionTaskRow, RelationView, UsageSummary,
 };
 
 // Entities / relations with confidence >= HIGH_CONFIDENCE_THRESHOLD are considered well-supported.
@@ -431,6 +431,123 @@ fn list_relations_for(
         })
     })?;
     rows.collect()
+}
+
+// ─── migration guard ──────────────────────────────────────────────────────────
+
+/// Ensures the two cost-tracking tables exist on any existing database.
+/// Called lazily before first access; safe to call multiple times (IF NOT EXISTS).
+pub fn ensure_ai_cost_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_usage_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            model         TEXT    NOT NULL,
+            prompt_type   TEXT    NOT NULL,
+            input_tokens  INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd      REAL    NOT NULL DEFAULT 0.0,
+            cache_hit     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS ai_exact_cache (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+            prompt_hash    TEXT    NOT NULL UNIQUE,
+            prompt_version TEXT    NOT NULL,
+            prompt_type    TEXT    NOT NULL,
+            api_type       TEXT    NOT NULL,
+            max_tokens     INTEGER NOT NULL DEFAULT 1200,
+            model          TEXT    NOT NULL,
+            response_json  TEXT    NOT NULL,
+            input_tokens   INTEGER NOT NULL DEFAULT 0,
+            output_tokens  INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+}
+
+// ─── ai_exact_cache ───────────────────────────────────────────────────────────
+
+pub fn get_exact_cache(
+    conn: &Connection,
+    hash: &str,
+) -> rusqlite::Result<Option<(String, i64, i64)>> {
+    conn.query_row(
+        "SELECT response_json, input_tokens, output_tokens FROM ai_exact_cache WHERE prompt_hash = ?1",
+        params![hash],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+    )
+    .optional()
+}
+
+pub fn save_exact_cache(
+    conn: &Connection,
+    hash: &str,
+    prompt_version: &str,
+    prompt_type: &str,
+    api_type: &str,
+    max_tokens: i64,
+    model: &str,
+    response_json: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO ai_exact_cache
+         (prompt_hash, prompt_version, prompt_type, api_type, max_tokens, model, response_json, input_tokens, output_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![hash, prompt_version, prompt_type, api_type, max_tokens, model, response_json, input_tokens, output_tokens],
+    )?;
+    Ok(())
+}
+
+// ─── ai_usage_log ─────────────────────────────────────────────────────────────
+
+pub fn log_ai_usage(
+    conn: &Connection,
+    model: &str,
+    prompt_type: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_usd: f64,
+    cache_hit: bool,
+) -> rusqlite::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO ai_usage_log (created_at, model, prompt_type, input_tokens, output_tokens, cost_usd, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![now, model, prompt_type, input_tokens, output_tokens, cost_usd, cache_hit as i64],
+    )?;
+    Ok(())
+}
+
+pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
+    ensure_ai_cost_tables(conn)?;
+    let total_cost_usd: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ai_usage_log",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_calls: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ai_usage_log",
+        [],
+        |row| row.get(0),
+    )?;
+    let cache_hit_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ai_usage_log WHERE cache_hit = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let today_cost_usd: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ai_usage_log WHERE date(created_at) = date('now')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(UsageSummary {
+        total_cost_usd,
+        total_calls,
+        cache_hit_count,
+        today_cost_usd,
+    })
 }
 
 // ─── ai_model_config ─────────────────────────────────────────────────────────

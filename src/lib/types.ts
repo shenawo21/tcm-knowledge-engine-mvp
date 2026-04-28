@@ -108,3 +108,10 @@ export interface TestConnectionResult {
   message: string;
   latencyMs: number | null;
 }
+
+export interface UsageSummary {
+  totalCostUsd: number;
+  todayCostUsd: number;
+  totalCalls: number;
+  cacheHitCount: number;
+}

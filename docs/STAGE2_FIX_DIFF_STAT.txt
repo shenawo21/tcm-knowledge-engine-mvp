@@ -1,0 +1,12 @@
+ database/schema.sql             |  33 +++++++++++
+ src-tauri/Cargo.lock            |   2 +
+ src-tauri/Cargo.toml            |   2 +
+ src-tauri/src/ai_processor.rs   |  52 ++++++++++++++++--
+ src-tauri/src/commands.rs       |  88 +++++++++++++++++++++++++++--
+ src-tauri/src/lib.rs            |   1 +
+ src-tauri/src/models.rs         |   9 +++
+ src-tauri/src/repository.rs     | 119 +++++++++++++++++++++++++++++++++++++++-
+ src/lib/api.ts                  |   5 ++
+ src/lib/types.ts                |   7 +++
+ src/pages/ModelSettingsPage.tsx |  26 ++++++++-
+ 11 files changed, 332 insertions(+), 12 deletions(-)

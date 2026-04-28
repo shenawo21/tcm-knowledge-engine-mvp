@@ -1,0 +1,560 @@
+diff --git a/database/schema.sql b/database/schema.sql
+index 5000f7c..62209a9 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -157,3 +157,36 @@ CREATE TABLE IF NOT EXISTS ai_model_config (
+   created_at    TEXT,
+   updated_at    TEXT
+ );
++
++-- -----------------------------------------------------------------------------
++-- AI usage log: records every AI call (real or cache hit) for cost tracking.
++-- input_text is never stored here to protect sensitive case data.
++-- -----------------------------------------------------------------------------
++CREATE TABLE IF NOT EXISTS ai_usage_log (
++  id            INTEGER PRIMARY KEY AUTOINCREMENT,
++  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
++  model         TEXT    NOT NULL,
++  prompt_type   TEXT    NOT NULL,
++  input_tokens  INTEGER NOT NULL DEFAULT 0,
++  output_tokens INTEGER NOT NULL DEFAULT 0,
++  cost_usd      REAL    NOT NULL DEFAULT 0.0,
++  cache_hit     INTEGER NOT NULL DEFAULT 0
++);
++
++-- -----------------------------------------------------------------------------
++-- AI exact cache: stores structured results keyed by a deterministic hash.
++-- Avoids redundant API calls for identical (prompt, model, input) tuples.
++-- -----------------------------------------------------------------------------
++CREATE TABLE IF NOT EXISTS ai_exact_cache (
++  id             INTEGER PRIMARY KEY AUTOINCREMENT,
++  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
++  prompt_hash    TEXT    NOT NULL UNIQUE,
++  prompt_version TEXT    NOT NULL,
++  prompt_type    TEXT    NOT NULL,
++  api_type       TEXT    NOT NULL,
++  max_tokens     INTEGER NOT NULL DEFAULT 1200,
++  model          TEXT    NOT NULL,
++  response_json  TEXT    NOT NULL,
++  input_tokens   INTEGER NOT NULL DEFAULT 0,
++  output_tokens  INTEGER NOT NULL DEFAULT 0
++);
+diff --git a/src-tauri/Cargo.lock b/src-tauri/Cargo.lock
+index 11a9d5d..3fb339c 100644
+--- a/src-tauri/Cargo.lock
++++ b/src-tauri/Cargo.lock
+@@ -3905,10 +3905,12 @@ version = "0.1.0"
+ dependencies = [
+  "chrono",
+  "dotenvy",
++ "hex",
+  "reqwest 0.12.28",
+  "rusqlite",
+  "serde",
+  "serde_json",
++ "sha2",
+  "tauri",
+  "tauri-build",
+  "uuid",
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index 439cb7b..1bfa6c3 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -21,3 +21,5 @@ uuid = { version = "1", features = ["v4"] }
+ chrono = { version = "0.4", features = ["serde"] }
+ reqwest = { version = "0.12", features = ["json"] }
+ dotenvy = "0.15"
++sha2 = "0.10"
++hex = "0.4"
+diff --git a/src-tauri/src/ai_processor.rs b/src-tauri/src/ai_processor.rs
+index 8dbfe62..1985795 100644
+--- a/src-tauri/src/ai_processor.rs
++++ b/src-tauri/src/ai_processor.rs
+@@ -3,12 +3,15 @@ use std::time::{Duration, Instant};
+ 
+ use reqwest::Client;
+ use serde_json::Value;
++use sha2::{Digest, Sha256};
+ 
+ use crate::models::{AiModelConfigRow, AiResult, TestConnectionResult};
+ 
+ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+ const DEFAULT_MODEL: &str = "gpt-4o-mini";
+ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
++const MAX_TOKENS: u32 = 1200;
++pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V1";
+ 
+ const SYSTEM_PROMPT: &str = r#"You are a TCM (Traditional Chinese Medicine) knowledge extraction assistant.
+ Given a Chinese medicine text, extract entities and relationships and return ONLY a JSON object with this exact structure (no markdown, no code blocks):
+@@ -41,11 +44,36 @@ Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reason
+ For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
+ Return ONLY valid JSON. No explanation, no markdown wrapping."#;
+ 
++pub fn normalize_input(s: &str) -> String {
++    s.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++pub fn compute_cache_key(
++    prompt_version: &str,
++    prompt_type: &str,
++    model_name: &str,
++    api_type: &str,
++    normalized_input: &str,
++) -> String {
++    let mut h = Sha256::new();
++    h.update(prompt_version.as_bytes());
++    h.update(b"\0");
++    h.update(prompt_type.as_bytes());
++    h.update(b"\0");
++    h.update(model_name.as_bytes());
++    h.update(b"\0");
++    h.update(api_type.as_bytes());
++    h.update(b"\0");
++    h.update(normalized_input.as_bytes());
++    hex::encode(h.finalize())
++}
++
+ /// Primary AI processing — DB config takes priority, falls back to env vars.
++/// Returns (AiResult, input_tokens, output_tokens).
+ pub async fn process(
+     input_text: &str,
+     config: Option<AiModelConfigRow>,
+-) -> Result<AiResult, String> {
++) -> Result<(AiResult, i64, i64), String> {
+     let (api_key, base_url, model_name, api_type) = resolve_credentials(config)?;
+     make_ai_request(input_text, &api_key, &base_url, &model_name, &api_type).await
+ }
+@@ -178,7 +206,7 @@ async fn make_ai_request(
+     base_url: &str,
+     model_name: &str,
+     api_type: &str,
+-) -> Result<AiResult, String> {
++) -> Result<(AiResult, i64, i64), String> {
+     let client = build_client()?;
+     let url = build_endpoint_url(base_url, api_type);
+ 
+@@ -187,6 +215,7 @@ async fn make_ai_request(
+             "model": model_name,
+             "instructions": SYSTEM_PROMPT,
+             "input": input_text,
++            "max_output_tokens": MAX_TOKENS,
+         }),
+         _ => serde_json::json!({
+             "model": model_name,
+@@ -195,7 +224,8 @@ async fn make_ai_request(
+                 {"role": "user", "content": input_text}
+             ],
+             "response_format": {"type": "json_object"},
+-            "temperature": 0.3
++            "temperature": 0.3,
++            "max_tokens": MAX_TOKENS,
+         }),
+     };
+ 
+@@ -219,9 +249,21 @@ async fn make_ai_request(
+         .await
+         .map_err(|e| format!("解析 API 响应失败: {e}"))?;
+ 
++    // Parse usage — failure here must not interrupt the main flow.
++    let input_tokens = response_value["usage"]["prompt_tokens"]
++        .as_i64()
++        .or_else(|| response_value["usage"]["input_tokens"].as_i64())
++        .unwrap_or(0);
++    let output_tokens = response_value["usage"]["completion_tokens"]
++        .as_i64()
++        .or_else(|| response_value["usage"]["output_tokens"].as_i64())
++        .unwrap_or(0);
++
+     let content = extract_content(&response_value, api_type)?;
+     let clean = strip_markdown(&content);
+ 
+-    serde_json::from_str::<AiResult>(clean)
+-        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))
++    let result = serde_json::from_str::<AiResult>(clean)
++        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))?;
++
++    Ok((result, input_tokens, output_tokens))
+ }
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index 95bc5d5..322558b 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -4,7 +4,7 @@ use crate::ai_processor;
+ use crate::db::AppState;
+ use crate::models::{
+     AiModelConfigView, AiResult, EntityDetail, EntityListItem, IngestionTaskRow,
+-    TestConnectionResult,
++    TestConnectionResult, UsageSummary,
+ };
+ use crate::repository;
+ 
+@@ -99,11 +99,13 @@ pub fn get_entity_detail(
+ }
+ 
+ /// process_with_ai: reads active model config from DB (falls back to env vars).
+-/// Lock released before the async HTTP call to avoid holding MutexGuard across await.
++/// Checks exact-hash cache before calling API. Logs usage on every call.
++/// Lock released before async HTTP call to avoid holding MutexGuard across await.
+ #[tauri::command]
+ pub async fn process_with_ai(
+     state: State<'_, AppState>,
+     input_text: String,
++    prompt_type: Option<String>,
+ ) -> Result<AiResult, String> {
+     let trimmed = input_text.trim().to_string();
+     if trimmed.is_empty() {
+@@ -112,12 +114,88 @@ pub async fn process_with_ai(
+     if trimmed.chars().count() > MAX_INPUT_TEXT_CHARS {
+         return Err(format!("input_text exceeds {MAX_INPUT_TEXT_CHARS} characters").into());
+     }
+-    let config_opt = {
++    let pt = prompt_type.as_deref().unwrap_or("default");
++    let normalized = ai_processor::normalize_input(&trimmed);
++
++    let (config_opt, model_name, api_type_str) = {
+         let conn = state.db.lock().map_err(lock_err)?;
+-        repository::get_active_ai_model_full(&conn).map_err(db_err)?
++        let config = repository::get_active_ai_model_full(&conn).map_err(db_err)?;
+         // MutexGuard dropped here
++        let (mn, at) = if let Some(ref c) = config {
++            (c.model_name.clone(), c.api_type.clone())
++        } else {
++            let mn = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
++            (mn, "chat_completions".to_string())
++        };
++        (config, mn, at)
++    };
++
++    let cache_key = ai_processor::compute_cache_key(
++        ai_processor::PROMPT_VERSION,
++        pt,
++        &model_name,
++        &api_type_str,
++        &normalized,
++    );
++
++    // Ensure tables exist on any pre-existing database before first access.
++    {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::ensure_ai_cost_tables(&conn).map_err(db_err)?;
++    }
++
++    // Check exact cache (lock → query → release)
++    let cached = {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::get_exact_cache(&conn, &cache_key).map_err(db_err)?
+     };
+-    ai_processor::process(&trimmed, config_opt).await
++
++    if let Some((cached_json, input_tokens, output_tokens)) = cached {
++        // If the stored JSON is corrupt, fall through to a fresh API call rather than erroring.
++        if let Ok(result) = serde_json::from_str::<AiResult>(&cached_json) {
++            if let Ok(conn) = state.db.lock() {
++                let _ = repository::log_ai_usage(
++                    &conn, &model_name, pt, input_tokens, output_tokens, 0.0, true,
++                );
++            }
++            return Ok(result);
++        }
++        // Corrupt cache entry — continue to API call below.
++    }
++
++    // Cache miss — call API (no lock held during await)
++    let (result, input_tokens, output_tokens) =
++        ai_processor::process(&trimmed, config_opt).await?;
++
++    // Write cache + log — failure here is non-fatal
++    if let Ok(conn) = state.db.lock() {
++        let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
++        if let Ok(json) = serde_json::to_string(&result) {
++            let _ = repository::save_exact_cache(
++                &conn,
++                &cache_key,
++                ai_processor::PROMPT_VERSION,
++                pt,
++                &api_type_str,
++                1200,
++                &model_name,
++                &json,
++                input_tokens,
++                output_tokens,
++            );
++        }
++        let _ = repository::log_ai_usage(
++            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
++        );
++    }
++
++    Ok(result)
++}
++
++#[tauri::command]
++pub fn get_usage_summary(state: State<'_, AppState>) -> Result<UsageSummary, String> {
++    let conn = state.db.lock().map_err(lock_err)?;
++    repository::get_usage_summary(&conn).map_err(db_err)
+ }
+ 
+ // ─── model config commands ────────────────────────────────────────────────────
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index d3f4872..5527ed6 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -29,6 +29,7 @@ pub fn run() {
+             commands::set_active_ai_model,
+             commands::get_active_ai_model,
+             commands::test_ai_model_connection,
++            commands::get_usage_summary,
+         ])
+         .run(tauri::generate_context!())
+         .expect("error while running tauri application");
+diff --git a/src-tauri/src/models.rs b/src-tauri/src/models.rs
+index 0f91c51..81379a2 100644
+--- a/src-tauri/src/models.rs
++++ b/src-tauri/src/models.rs
+@@ -154,3 +154,12 @@ pub struct TestConnectionResult {
+     pub message: String,
+     pub latency_ms: Option<u64>,
+ }
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UsageSummary {
++    pub total_cost_usd: f64,
++    pub total_calls: i64,
++    pub cache_hit_count: i64,
++    pub today_cost_usd: f64,
++}
+diff --git a/src-tauri/src/repository.rs b/src-tauri/src/repository.rs
+index 20638f4..55617d8 100644
+--- a/src-tauri/src/repository.rs
++++ b/src-tauri/src/repository.rs
+@@ -6,7 +6,7 @@ use uuid::Uuid;
+ 
+ use crate::models::{
+     AiModelConfigRow, AiModelConfigView, AiResult, EntityDetail, EntityListItem, EntityRow,
+-    IngestionTaskRow, RelationView,
++    IngestionTaskRow, RelationView, UsageSummary,
+ };
+ 
+ // Entities / relations with confidence >= HIGH_CONFIDENCE_THRESHOLD are considered well-supported.
+@@ -433,6 +433,123 @@ fn list_relations_for(
+     rows.collect()
+ }
+ 
++// ─── migration guard ──────────────────────────────────────────────────────────
++
++/// Ensures the two cost-tracking tables exist on any existing database.
++/// Called lazily before first access; safe to call multiple times (IF NOT EXISTS).
++pub fn ensure_ai_cost_tables(conn: &Connection) -> rusqlite::Result<()> {
++    conn.execute_batch(
++        "CREATE TABLE IF NOT EXISTS ai_usage_log (
++            id            INTEGER PRIMARY KEY AUTOINCREMENT,
++            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
++            model         TEXT    NOT NULL,
++            prompt_type   TEXT    NOT NULL,
++            input_tokens  INTEGER NOT NULL DEFAULT 0,
++            output_tokens INTEGER NOT NULL DEFAULT 0,
++            cost_usd      REAL    NOT NULL DEFAULT 0.0,
++            cache_hit     INTEGER NOT NULL DEFAULT 0
++        );
++        CREATE TABLE IF NOT EXISTS ai_exact_cache (
++            id             INTEGER PRIMARY KEY AUTOINCREMENT,
++            created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
++            prompt_hash    TEXT    NOT NULL UNIQUE,
++            prompt_version TEXT    NOT NULL,
++            prompt_type    TEXT    NOT NULL,
++            api_type       TEXT    NOT NULL,
++            max_tokens     INTEGER NOT NULL DEFAULT 1200,
++            model          TEXT    NOT NULL,
++            response_json  TEXT    NOT NULL,
++            input_tokens   INTEGER NOT NULL DEFAULT 0,
++            output_tokens  INTEGER NOT NULL DEFAULT 0
++        );",
++    )
++}
++
++// ─── ai_exact_cache ───────────────────────────────────────────────────────────
++
++pub fn get_exact_cache(
++    conn: &Connection,
++    hash: &str,
++) -> rusqlite::Result<Option<(String, i64, i64)>> {
++    conn.query_row(
++        "SELECT response_json, input_tokens, output_tokens FROM ai_exact_cache WHERE prompt_hash = ?1",
++        params![hash],
++        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
++    )
++    .optional()
++}
++
++pub fn save_exact_cache(
++    conn: &Connection,
++    hash: &str,
++    prompt_version: &str,
++    prompt_type: &str,
++    api_type: &str,
++    max_tokens: i64,
++    model: &str,
++    response_json: &str,
++    input_tokens: i64,
++    output_tokens: i64,
++) -> rusqlite::Result<()> {
++    conn.execute(
++        "INSERT OR IGNORE INTO ai_exact_cache
++         (prompt_hash, prompt_version, prompt_type, api_type, max_tokens, model, response_json, input_tokens, output_tokens)
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
++        params![hash, prompt_version, prompt_type, api_type, max_tokens, model, response_json, input_tokens, output_tokens],
++    )?;
++    Ok(())
++}
++
++// ─── ai_usage_log ─────────────────────────────────────────────────────────────
++
++pub fn log_ai_usage(
++    conn: &Connection,
++    model: &str,
++    prompt_type: &str,
++    input_tokens: i64,
++    output_tokens: i64,
++    cost_usd: f64,
++    cache_hit: bool,
++) -> rusqlite::Result<()> {
++    let now = now_iso();
++    conn.execute(
++        "INSERT INTO ai_usage_log (created_at, model, prompt_type, input_tokens, output_tokens, cost_usd, cache_hit)
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
++        params![now, model, prompt_type, input_tokens, output_tokens, cost_usd, cache_hit as i64],
++    )?;
++    Ok(())
++}
++
++pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
++    ensure_ai_cost_tables(conn)?;
++    let total_cost_usd: f64 = conn.query_row(
++        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ai_usage_log",
++        [],
++        |row| row.get(0),
++    )?;
++    let total_calls: i64 = conn.query_row(
++        "SELECT COUNT(*) FROM ai_usage_log",
++        [],
++        |row| row.get(0),
++    )?;
++    let cache_hit_count: i64 = conn.query_row(
++        "SELECT COUNT(*) FROM ai_usage_log WHERE cache_hit = 1",
++        [],
++        |row| row.get(0),
++    )?;
++    let today_cost_usd: f64 = conn.query_row(
++        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ai_usage_log WHERE date(created_at) = date('now')",
++        [],
++        |row| row.get(0),
++    )?;
++    Ok(UsageSummary {
++        total_cost_usd,
++        total_calls,
++        cache_hit_count,
++        today_cost_usd,
++    })
++}
++
+ // ─── ai_model_config ─────────────────────────────────────────────────────────
+ 
+ fn mask_api_key(key: &str) -> String {
+diff --git a/src/lib/api.ts b/src/lib/api.ts
+index 1805e45..ebf648c 100644
+--- a/src/lib/api.ts
++++ b/src/lib/api.ts
+@@ -6,6 +6,7 @@ import type {
+   EntityListItem,
+   IngestionTaskRow,
+   TestConnectionResult,
++  UsageSummary,
+ } from './types';
+ 
+ export class ApiError extends Error {
+@@ -99,3 +100,7 @@ export async function getActiveAiModel(): Promise<AiModelConfigView | null> {
+ export async function testAiModelConnection(configId: string): Promise<TestConnectionResult> {
+   return call<TestConnectionResult>('test_ai_model_connection', { configId });
+ }
++
++export async function getUsageSummary(): Promise<UsageSummary> {
++  return call<UsageSummary>('get_usage_summary');
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index ca73fda..92d1659 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -108,3 +108,10 @@ export interface TestConnectionResult {
+   message: string;
+   latencyMs: number | null;
+ }
++
++export interface UsageSummary {
++  totalCostUsd: number;
++  todayCostUsd: number;
++  totalCalls: number;
++  cacheHitCount: number;
++}
+diff --git a/src/pages/ModelSettingsPage.tsx b/src/pages/ModelSettingsPage.tsx
+index 2b9c5fb..6d5d1ca 100644
+--- a/src/pages/ModelSettingsPage.tsx
++++ b/src/pages/ModelSettingsPage.tsx
+@@ -1,11 +1,12 @@
+ import { useEffect, useState } from 'react';
+ import {
++  getUsageSummary,
+   listAiModelConfigs,
+   saveAiModelConfig,
+   setActiveAiModel,
+   testAiModelConnection,
+ } from '../lib/api';
+-import type { AiModelConfigView, TestConnectionResult } from '../lib/types';
++import type { AiModelConfigView, TestConnectionResult, UsageSummary } from '../lib/types';
+ 
+ type ApiType = 'chat_completions' | 'responses';
+ 
+@@ -40,6 +41,9 @@ export function ModelSettingsPage() {
+   const [settingActiveId, setSettingActiveId] = useState<string | null>(null);
+   const [activeError, setActiveError] = useState<string | null>(null);
+ 
++  const [usage, setUsage] = useState<UsageSummary | null>(null);
++  const [usageError, setUsageError] = useState(false);
++
+   const activeConfig = configs.find(c => c.isActive) ?? null;
+ 
+   function field(key: keyof FormState) {
+@@ -60,6 +64,9 @@ export function ModelSettingsPage() {
+ 
+   useEffect(() => {
+     loadConfigs();
++    getUsageSummary()
++      .then(setUsage)
++      .catch(() => setUsageError(true));
+   }, []);
+ 
+   async function handleSave(e: React.FormEvent) {
+@@ -125,6 +132,23 @@ export function ModelSettingsPage() {
+     <section>
+       <h1>模型设置</h1>
+ 
++      {/* AI usage summary */}
++      <div className="panel">
++        <h2>AI 用量统计</h2>
++        {usageError ? (
++          <p style={{ color: 'var(--color-muted, #888)' }}>AI 用量统计暂不可用</p>
++        ) : usage === null ? (
++          <p style={{ color: 'var(--color-muted, #888)' }}>加载中…</p>
++        ) : (
++          <p>
++            本月消耗&nbsp;<b>${usage.totalCostUsd.toFixed(4)}</b>&nbsp;/&nbsp;$12.00
++            &nbsp;｜&nbsp;今日&nbsp;<b>${usage.todayCostUsd.toFixed(4)}</b>
++            &nbsp;｜&nbsp;总调用&nbsp;<b>{usage.totalCalls}</b>&nbsp;次
++            &nbsp;｜&nbsp;缓存命中&nbsp;<b>{usage.cacheHitCount}</b>&nbsp;次
++          </p>
++        )}
++      </div>
++
+       {/* Active model */}
+       <div className="panel">
+         <h2>当前激活模型</h2>

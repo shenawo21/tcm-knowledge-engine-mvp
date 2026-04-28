@@ -154,3 +154,12 @@ pub struct TestConnectionResult {
     pub message: String,
     pub latency_ms: Option<u64>,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummary {
+    pub total_cost_usd: f64,
+    pub total_calls: i64,
+    pub cache_hit_count: i64,
+    pub today_cost_usd: f64,
+}

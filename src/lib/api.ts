@@ -6,6 +6,7 @@ import type {
   EntityListItem,
   IngestionTaskRow,
   TestConnectionResult,
+  UsageSummary,
 } from './types';
 
 export class ApiError extends Error {
@@ -98,4 +99,8 @@ export async function getActiveAiModel(): Promise<AiModelConfigView | null> {
 
 export async function testAiModelConnection(configId: string): Promise<TestConnectionResult> {
   return call<TestConnectionResult>('test_ai_model_connection', { configId });
+}
+
+export async function getUsageSummary(): Promise<UsageSummary> {
+  return call<UsageSummary>('get_usage_summary');
 }

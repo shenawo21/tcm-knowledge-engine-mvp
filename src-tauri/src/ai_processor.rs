@@ -3,12 +3,15 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::models::{AiModelConfigRow, AiResult, TestConnectionResult};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TOKENS: u32 = 1200;
+pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V1";
 
 const SYSTEM_PROMPT: &str = r#"You are a TCM (Traditional Chinese Medicine) knowledge extraction assistant.
 Given a Chinese medicine text, extract entities and relationships and return ONLY a JSON object with this exact structure (no markdown, no code blocks):
@@ -41,11 +44,36 @@ Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reason
 For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
 Return ONLY valid JSON. No explanation, no markdown wrapping."#;
 
+pub fn normalize_input(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn compute_cache_key(
+    prompt_version: &str,
+    prompt_type: &str,
+    model_name: &str,
+    api_type: &str,
+    normalized_input: &str,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(prompt_version.as_bytes());
+    h.update(b"\0");
+    h.update(prompt_type.as_bytes());
+    h.update(b"\0");
+    h.update(model_name.as_bytes());
+    h.update(b"\0");
+    h.update(api_type.as_bytes());
+    h.update(b"\0");
+    h.update(normalized_input.as_bytes());
+    hex::encode(h.finalize())
+}
+
 /// Primary AI processing — DB config takes priority, falls back to env vars.
+/// Returns (AiResult, input_tokens, output_tokens).
 pub async fn process(
     input_text: &str,
     config: Option<AiModelConfigRow>,
-) -> Result<AiResult, String> {
+) -> Result<(AiResult, i64, i64), String> {
     let (api_key, base_url, model_name, api_type) = resolve_credentials(config)?;
     make_ai_request(input_text, &api_key, &base_url, &model_name, &api_type).await
 }
@@ -178,7 +206,7 @@ async fn make_ai_request(
     base_url: &str,
     model_name: &str,
     api_type: &str,
-) -> Result<AiResult, String> {
+) -> Result<(AiResult, i64, i64), String> {
     let client = build_client()?;
     let url = build_endpoint_url(base_url, api_type);
 
@@ -187,6 +215,7 @@ async fn make_ai_request(
             "model": model_name,
             "instructions": SYSTEM_PROMPT,
             "input": input_text,
+            "max_output_tokens": MAX_TOKENS,
         }),
         _ => serde_json::json!({
             "model": model_name,
@@ -195,7 +224,8 @@ async fn make_ai_request(
                 {"role": "user", "content": input_text}
             ],
             "response_format": {"type": "json_object"},
-            "temperature": 0.3
+            "temperature": 0.3,
+            "max_tokens": MAX_TOKENS,
         }),
     };
 
@@ -219,9 +249,21 @@ async fn make_ai_request(
         .await
         .map_err(|e| format!("解析 API 响应失败: {e}"))?;
 
+    // Parse usage — failure here must not interrupt the main flow.
+    let input_tokens = response_value["usage"]["prompt_tokens"]
+        .as_i64()
+        .or_else(|| response_value["usage"]["input_tokens"].as_i64())
+        .unwrap_or(0);
+    let output_tokens = response_value["usage"]["completion_tokens"]
+        .as_i64()
+        .or_else(|| response_value["usage"]["output_tokens"].as_i64())
+        .unwrap_or(0);
+
     let content = extract_content(&response_value, api_type)?;
     let clean = strip_markdown(&content);
 
-    serde_json::from_str::<AiResult>(clean)
-        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))
+    let result = serde_json::from_str::<AiResult>(clean)
+        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))?;
+
+    Ok((result, input_tokens, output_tokens))
 }

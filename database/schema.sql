@@ -157,3 +157,36 @@ CREATE TABLE IF NOT EXISTS ai_model_config (
   created_at    TEXT,
   updated_at    TEXT
 );
+
+-- -----------------------------------------------------------------------------
+-- AI usage log: records every AI call (real or cache hit) for cost tracking.
+-- input_text is never stored here to protect sensitive case data.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_usage_log (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  model         TEXT    NOT NULL,
+  prompt_type   TEXT    NOT NULL,
+  input_tokens  INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd      REAL    NOT NULL DEFAULT 0.0,
+  cache_hit     INTEGER NOT NULL DEFAULT 0
+);
+
+-- -----------------------------------------------------------------------------
+-- AI exact cache: stores structured results keyed by a deterministic hash.
+-- Avoids redundant API calls for identical (prompt, model, input) tuples.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_exact_cache (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  prompt_hash    TEXT    NOT NULL UNIQUE,
+  prompt_version TEXT    NOT NULL,
+  prompt_type    TEXT    NOT NULL,
+  api_type       TEXT    NOT NULL,
+  max_tokens     INTEGER NOT NULL DEFAULT 1200,
+  model          TEXT    NOT NULL,
+  response_json  TEXT    NOT NULL,
+  input_tokens   INTEGER NOT NULL DEFAULT 0,
+  output_tokens  INTEGER NOT NULL DEFAULT 0
+);
