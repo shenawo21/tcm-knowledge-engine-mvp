@@ -1,0 +1,3 @@
+ docs/LITELLM_LOCAL_SETUP.md          | 41 ++++++++++++++++++++++----
+ docs/LITELLM_VALIDATION_CHECKLIST.md | 56 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 5 deletions(-)

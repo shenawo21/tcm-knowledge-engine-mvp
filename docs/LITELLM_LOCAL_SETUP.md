@@ -39,7 +39,38 @@ LITELLM_MASTER_KEY=sk-local-litellm
 
 ---
 
-## 三、启动 LiteLLM Proxy
+## 三、Windows 代理注意事项（重要）
+
+**若本机运行了 Clash、VPN 或其他代理软件，必须先配置 localhost 直连，否则 App 请求会返回 502。**
+
+### 方法 A：启动前在 PowerShell 设置 NO_PROXY
+
+在启动 LiteLLM 和 App 的同一个 PowerShell 终端中执行：
+
+```powershell
+$env:NO_PROXY="127.0.0.1,localhost,::1"
+$env:no_proxy="127.0.0.1,localhost,::1"
+```
+
+然后在**同一终端**启动 LiteLLM 和 `npm run tauri dev`，两者都会继承该环境变量。
+
+> reqwest（App 的 Rust HTTP 客户端）默认读取 `NO_PROXY`，设置后 127.0.0.1 的请求将直连。
+
+### 方法 B：在代理软件中添加直连规则（推荐，一劳永逸）
+
+在 Clash Verge 或其他代理客户端的规则列表中添加：
+
+```
+DOMAIN,localhost,DIRECT
+IP-CIDR,127.0.0.1/32,DIRECT
+IP-CIDR,::1/128,DIRECT
+```
+
+配置后所有应用的 localhost 请求均直连，无需每次设置环境变量。
+
+---
+
+## 四、启动 LiteLLM Proxy
 
 ```bash
 cd tcm-knowledge-engine-mvp/litellm
@@ -54,7 +85,7 @@ INFO:     Uvicorn running on http://0.0.0.0:4000
 
 ---
 
-## 四、App 模型配置填写
+## 五、App 模型配置填写
 
 在「模型设置」页面新增配置：
 
@@ -74,19 +105,19 @@ INFO:     Uvicorn running on http://0.0.0.0:4000
 
 ---
 
-## 五、验证接入
+## 六、验证接入
 
 详见 `docs/LITELLM_VALIDATION_CHECKLIST.md`。
 
 ---
 
-## 六、停止代理
+## 七、停止代理
 
 在 LiteLLM 终端窗口按 `Ctrl+C`。App 可切回 OpenRouter 直连配置继续使用。
 
 ---
 
-## 七、不做的事项
+## 八、不做的事项
 
 - 不配置 Redis 缓存（exact cache 在 App 的 SQLite 中）
 - 不配置 fallback 或多模型路由
