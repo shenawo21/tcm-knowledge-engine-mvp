@@ -41,6 +41,8 @@ export function ModelSettingsPage() {
   const [settingActiveId, setSettingActiveId] = useState<string | null>(null);
   const [activeError, setActiveError] = useState<string | null>(null);
 
+  const [editingId, setEditingId] = useState<string | null>(null);
+
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [usageError, setUsageError] = useState(false);
 
@@ -72,8 +74,13 @@ export function ModelSettingsPage() {
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     const { providerName, baseUrl, apiKey, modelName, apiType } = form;
-    if (!providerName.trim() || !baseUrl.trim() || !apiKey.trim() || !modelName.trim()) {
+    if (!providerName.trim() || !baseUrl.trim() || !modelName.trim()) {
       setSaveMsg({ ok: false, text: '所有字段均为必填项。' });
+      return;
+    }
+    // New config requires a key; editing allows blank (= preserve existing).
+    if (!editingId && !apiKey.trim()) {
+      setSaveMsg({ ok: false, text: 'API Key 为必填项。' });
       return;
     }
     setSaving(true);
@@ -85,9 +92,11 @@ export function ModelSettingsPage() {
         apiKey.trim(),
         modelName.trim(),
         apiType,
+        editingId ?? undefined,
       );
-      setSaveMsg({ ok: true, text: `配置已保存（id: ${newId}）` });
+      setSaveMsg({ ok: true, text: `配置已${editingId ? '更新' : '保存'}（id: ${newId}）` });
       setForm(INITIAL_FORM);
+      setEditingId(null);
       loadConfigs();
     } catch (err) {
       setSaveMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
@@ -113,6 +122,24 @@ export function ModelSettingsPage() {
     } finally {
       setTestingId(null);
     }
+  }
+
+  function handleEdit(cfg: AiModelConfigView) {
+    setEditingId(cfg.id);
+    setForm({
+      providerName: cfg.providerName,
+      baseUrl: cfg.baseUrl,
+      apiKey: '', // blank — user must re-enter to change; blank = preserve existing
+      modelName: cfg.modelName,
+      apiType: cfg.apiType as ApiType,
+    });
+    setSaveMsg(null);
+  }
+
+  function handleCancelEdit() {
+    setEditingId(null);
+    setForm(INITIAL_FORM);
+    setSaveMsg(null);
   }
 
   async function handleSetActive(configId: string) {
@@ -163,9 +190,9 @@ export function ModelSettingsPage() {
         )}
       </div>
 
-      {/* New config form */}
+      {/* New / edit config form */}
       <div className="panel">
-        <h2>新增配置</h2>
+        <h2>{editingId ? '编辑配置' : '新增配置'}</h2>
         <form onSubmit={handleSave}>
           <div style={{ display: 'grid', gap: '8px', maxWidth: '480px' }}>
             <label>
@@ -192,7 +219,7 @@ export function ModelSettingsPage() {
                 type="password"
                 value={form.apiKey}
                 onChange={field('apiKey')}
-                placeholder="sk-..."
+                placeholder={editingId ? '（留空保留原 Key，输入新 Key 以替换）' : 'sk-...'}
                 autoComplete="off"
                 disabled={saving}
               />
@@ -214,9 +241,16 @@ export function ModelSettingsPage() {
               </select>
             </label>
           </div>
-          <button className="primary" type="submit" disabled={saving} style={{ marginTop: '12px' }}>
-            {saving ? '保存中...' : '保存配置'}
-          </button>
+          <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+            <button className="primary" type="submit" disabled={saving}>
+              {saving ? '保存中...' : editingId ? '更新配置' : '保存配置'}
+            </button>
+            {editingId && (
+              <button type="button" onClick={handleCancelEdit} disabled={saving}>
+                取消编辑
+              </button>
+            )}
+          </div>
         </form>
         {saveMsg && (
           <p style={{ color: saveMsg.ok ? 'green' : 'crimson', marginTop: '8px' }}>
@@ -259,8 +293,11 @@ export function ModelSettingsPage() {
               <p style={{ margin: '2px 0', fontSize: '0.9em' }}>
                 模型: <b>{cfg.modelName}</b>&nbsp;({cfg.apiType})
               </p>
-              <p style={{ margin: '2px 0 10px', fontSize: '0.9em' }}>
+              <p style={{ margin: '2px 0', fontSize: '0.9em' }}>
                 Key: <code>{cfg.maskedApiKey}</code>
+              </p>
+              <p style={{ margin: '2px 0 10px', fontSize: '0.75em', color: '#888' }}>
+                诊断: {cfg.keyDiagnostic}
               </p>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                 <button onClick={() => handleTest(cfg.id)} disabled={isTesting}>
@@ -271,6 +308,9 @@ export function ModelSettingsPage() {
                     {isSettingActive ? '设置中...' : '设为当前'}
                   </button>
                 )}
+                <button onClick={() => handleEdit(cfg)} disabled={editingId === cfg.id}>
+                  {editingId === cfg.id ? '编辑中...' : '编辑'}
+                </button>
               </div>
               {testResult && (
                 <p

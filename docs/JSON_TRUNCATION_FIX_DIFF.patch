@@ -1,0 +1,448 @@
+diff --git a/src-tauri/src/ai_processor.rs b/src-tauri/src/ai_processor.rs
+index 1985795..a87d552 100644
+--- a/src-tauri/src/ai_processor.rs
++++ b/src-tauri/src/ai_processor.rs
+@@ -5,13 +5,13 @@ use reqwest::Client;
+ use serde_json::Value;
+ use sha2::{Digest, Sha256};
+ 
+-use crate::models::{AiModelConfigRow, AiResult, TestConnectionResult};
++use crate::models::{AiCallOutcome, AiModelConfigRow, AiResult, TestConnectionResult};
+ 
+ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+ const DEFAULT_MODEL: &str = "gpt-4o-mini";
+-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+-const MAX_TOKENS: u32 = 1200;
+-pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V1";
++const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
++const MAX_TOKENS: u32 = 1800;
++pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V2";
+ 
+ const SYSTEM_PROMPT: &str = r#"You are a TCM (Traditional Chinese Medicine) knowledge extraction assistant.
+ Given a Chinese medicine text, extract entities and relationships and return ONLY a JSON object with this exact structure (no markdown, no code blocks):
+@@ -42,7 +42,8 @@ Given a Chinese medicine text, extract entities and relationships and return ONL
+ Review levels: A = classical source or well-evidenced, B = modern/reasonable, C = uncertain or low-quality source.
+ Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reasonably inferred, will be flagged for human review; < 0.50 = uncertain, omit unless significant. Do not fabricate entities or relationships; fewer honest entries are better than more invented ones.
+ For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
+-Return ONLY valid JSON. No explanation, no markdown wrapping."#;
++STRICT OUTPUT LIMITS (prioritise the most important items to stay within token budget): entities ≤ 20, relations ≤ 20, western_mapping ≤ 5, key_points ≤ 5. The JSON must be complete and valid — no trailing commas, no truncation, no ellipsis. If you cannot fit all items, drop the least important ones entirely.
++Return ONLY valid JSON. No explanation, no markdown, no code fences."#;
+ 
+ pub fn normalize_input(s: &str) -> String {
+     s.split_whitespace().collect::<Vec<_>>().join(" ")
+@@ -69,11 +70,12 @@ pub fn compute_cache_key(
+ }
+ 
+ /// Primary AI processing — DB config takes priority, falls back to env vars.
+-/// Returns (AiResult, input_tokens, output_tokens).
++/// Returns AiCallOutcome which always carries token usage (even on content failure).
++/// Outer Err is reserved for network/transport failures where no usage data exists.
+ pub async fn process(
+     input_text: &str,
+     config: Option<AiModelConfigRow>,
+-) -> Result<(AiResult, i64, i64), String> {
++) -> Result<AiCallOutcome, String> {
+     let (api_key, base_url, model_name, api_type) = resolve_credentials(config)?;
+     make_ai_request(input_text, &api_key, &base_url, &model_name, &api_type).await
+ }
+@@ -206,7 +208,7 @@ async fn make_ai_request(
+     base_url: &str,
+     model_name: &str,
+     api_type: &str,
+-) -> Result<(AiResult, i64, i64), String> {
++) -> Result<AiCallOutcome, String> {
+     let client = build_client()?;
+     let url = build_endpoint_url(base_url, api_type);
+ 
+@@ -249,7 +251,7 @@ async fn make_ai_request(
+         .await
+         .map_err(|e| format!("解析 API 响应失败: {e}"))?;
+ 
+-    // Parse usage — failure here must not interrupt the main flow.
++    // Parse usage — failure must not interrupt the main flow.
+     let input_tokens = response_value["usage"]["prompt_tokens"]
+         .as_i64()
+         .or_else(|| response_value["usage"]["input_tokens"].as_i64())
+@@ -259,11 +261,40 @@ async fn make_ai_request(
+         .or_else(|| response_value["usage"]["output_tokens"].as_i64())
+         .unwrap_or(0);
+ 
++    // Check finish_reason before attempting JSON parse.
++    let finish_reason = response_value["choices"][0]["finish_reason"]
++        .as_str()
++        .or_else(|| response_value["incomplete_details"]["reason"].as_str())
++        .unwrap_or("");
++
++    if finish_reason == "length" {
++        return Ok(AiCallOutcome {
++            result: Err(
++                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。"
++                    .to_string(),
++            ),
++            input_tokens,
++            output_tokens,
++        });
++    }
++
+     let content = extract_content(&response_value, api_type)?;
+     let clean = strip_markdown(&content);
+ 
+-    let result = serde_json::from_str::<AiResult>(clean)
+-        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))?;
++    let result = match serde_json::from_str::<AiResult>(clean) {
++        Ok(r) => r,
++        Err(e) => {
++            let preview: String = content.chars().take(500).collect();
++            let suffix = if content.chars().count() > 500 { "…（已截断）" } else { "" };
++            return Ok(AiCallOutcome {
++                result: Err(format!(
++                    "解析 AI 输出 JSON 失败: {e}\n预览（前500字符）:\n{preview}{suffix}"
++                )),
++                input_tokens,
++                output_tokens,
++            });
++        }
++    };
+ 
+-    Ok((result, input_tokens, output_tokens))
++    Ok(AiCallOutcome { result: Ok(result), input_tokens, output_tokens })
+ }
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index 322558b..e14eaee 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -164,12 +164,22 @@ pub async fn process_with_ai(
+     }
+ 
+     // Cache miss — call API (no lock held during await)
+-    let (result, input_tokens, output_tokens) =
+-        ai_processor::process(&trimmed, config_opt).await?;
++    let outcome = ai_processor::process(&trimmed, config_opt).await?;
++    let (input_tokens, output_tokens) = (outcome.input_tokens, outcome.output_tokens);
+ 
+-    // Write cache + log — failure here is non-fatal
++    // Log usage regardless of parse outcome — the API was called and cost was incurred.
+     if let Ok(conn) = state.db.lock() {
+         let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
++        let _ = repository::log_ai_usage(
++            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
++        );
++    }
++
++    // Propagate content-level error after usage is logged.
++    let result = outcome.result?;
++
++    // Write cache only on successful parse — never cache truncated or malformed JSON.
++    if let Ok(conn) = state.db.lock() {
+         if let Ok(json) = serde_json::to_string(&result) {
+             let _ = repository::save_exact_cache(
+                 &conn,
+@@ -177,16 +187,13 @@ pub async fn process_with_ai(
+                 ai_processor::PROMPT_VERSION,
+                 pt,
+                 &api_type_str,
+-                1200,
++                1800,
+                 &model_name,
+                 &json,
+                 input_tokens,
+                 output_tokens,
+             );
+         }
+-        let _ = repository::log_ai_usage(
+-            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
+-        );
+     }
+ 
+     Ok(result)
+@@ -222,9 +229,6 @@ pub fn save_ai_model_config(
+     if base_url.is_empty() {
+         return Err("base_url is required".into());
+     }
+-    if api_key.is_empty() {
+-        return Err("api_key is required".into());
+-    }
+     if model_name.is_empty() {
+         return Err("model_name is required".into());
+     }
+@@ -233,6 +237,28 @@ pub fn save_ai_model_config(
+             "api_type must be chat_completions or responses, got: {api_type}"
+         ));
+     }
++    // Saving a masked key would silently break authentication.
++    if api_key.contains("****") {
++        return Err(
++            "API Key 无效：不能保存脱敏格式（如 sk-****xxxx），请输入完整 Key。".into(),
++        );
++    }
++    // When editing (id provided) and key left blank → preserve the existing key from DB.
++    let resolved_key: String = if api_key.is_empty() {
++        match id.as_deref() {
++            Some(existing_id) => {
++                let conn = state.db.lock().map_err(lock_err)?;
++                let existing = repository::get_ai_model_config_by_id(&conn, existing_id)
++                    .map_err(db_err)?
++                    .ok_or_else(|| format!("config not found: {existing_id}"))?;
++                existing.api_key
++                // conn (MutexGuard) dropped here
++            }
++            None => return Err("api_key is required".into()),
++        }
++    } else {
++        api_key.to_string()
++    };
+ 
+     let conn = state.db.lock().map_err(lock_err)?;
+     repository::save_ai_model_config(
+@@ -240,7 +266,7 @@ pub fn save_ai_model_config(
+         id.as_deref(),
+         provider_name,
+         base_url,
+-        api_key,
++        &resolved_key,
+         model_name,
+         api_type,
+     )
+diff --git a/src-tauri/src/models.rs b/src-tauri/src/models.rs
+index 81379a2..2a30ede 100644
+--- a/src-tauri/src/models.rs
++++ b/src-tauri/src/models.rs
+@@ -118,6 +118,15 @@ pub struct EntityDetail {
+     pub incoming: Vec<RelationView>,
+ }
+ 
++/// Internal outcome of one AI API call.
++/// Outer Err = network/transport failure (no usage data available).
++/// Outer Ok with inner Err = API responded but content failed (usage data present, must be logged).
++pub struct AiCallOutcome {
++    pub result: Result<AiResult, String>,
++    pub input_tokens: i64,
++    pub output_tokens: i64,
++}
++
+ /// Internal row — NOT Serialize; api_key must never reach the frontend.
+ #[derive(Debug)]
+ pub struct AiModelConfigRow {
+@@ -132,7 +141,9 @@ pub struct AiModelConfigRow {
+     pub updated_at: Option<String>,
+ }
+ 
+-/// Frontend-safe view — api_key is replaced by masked_api_key.
++/// Frontend-safe view — api_key is replaced by masked_api_key and key_diagnostic.
++/// key_diagnostic exposes only length, 8-char prefix, and last-4 suffix for debugging;
++/// the full key is never included.
+ #[derive(Debug, Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct AiModelConfigView {
+@@ -140,6 +151,8 @@ pub struct AiModelConfigView {
+     pub provider_name: String,
+     pub base_url: String,
+     pub masked_api_key: String,
++    /// Diagnostic only: "present=true len=X prefix=Y last4=Z" — never the full key.
++    pub key_diagnostic: String,
+     pub model_name: String,
+     pub api_type: String,
+     pub is_active: bool,
+diff --git a/src-tauri/src/repository.rs b/src-tauri/src/repository.rs
+index 55617d8..f47c6b1 100644
+--- a/src-tauri/src/repository.rs
++++ b/src-tauri/src/repository.rs
+@@ -552,6 +552,17 @@ pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
+ 
+ // ─── ai_model_config ─────────────────────────────────────────────────────────
+ 
++fn make_key_diagnostic(key: &str) -> String {
++    let key = key.trim();
++    if key.is_empty() {
++        return "present=false".to_string();
++    }
++    let len = key.chars().count();
++    let prefix: String = key.chars().take(8).collect();
++    let last4: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
++    format!("present=true len={} prefix={} last4={}", len, prefix, last4)
++}
++
+ fn mask_api_key(key: &str) -> String {
+     let key = key.trim();
+     let char_count = key.chars().count();
+@@ -573,6 +584,7 @@ fn mask_api_key(key: &str) -> String {
+ fn to_config_view(row: AiModelConfigRow) -> AiModelConfigView {
+     AiModelConfigView {
+         masked_api_key: mask_api_key(&row.api_key),
++        key_diagnostic: make_key_diagnostic(&row.api_key),
+         id: row.id,
+         provider_name: row.provider_name,
+         base_url: row.base_url,
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 92d1659..1b4b99b 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -96,6 +96,8 @@ export interface AiModelConfigView {
+   providerName: string;
+   baseUrl: string;
+   maskedApiKey: string;
++  /** Diagnostic only: never contains the full key. */
++  keyDiagnostic: string;
+   modelName: string;
+   apiType: string;
+   isActive: boolean;
+diff --git a/src/pages/IngestionPage.tsx b/src/pages/IngestionPage.tsx
+index b229b99..86dfc8e 100644
+--- a/src/pages/IngestionPage.tsx
++++ b/src/pages/IngestionPage.tsx
+@@ -60,7 +60,21 @@ export function IngestionPage() {
+         {status.kind === 'done' && (
+           <p>已写入数据库（task = {status.taskId}）。切到「知识库」页查看。</p>
+         )}
+-        {status.kind === 'error' && <p style={{ color: 'crimson' }}>错误：{status.message}</p>}
++        {status.kind === 'error' && (
++          <div style={{ color: 'crimson' }}>
++            <p>
++              错误：
++              {status.message.length > 300
++                ? status.message.slice(0, 300) + '…（详情已截断）'
++                : status.message}
++            </p>
++            {(status.message.includes('max_tokens') || status.message.includes('截断')) && (
++              <p style={{ fontSize: '0.9em', marginTop: '4px' }}>
++                建议：缩短输入文本（500 字以内）后重试，或分段处理。
++              </p>
++            )}
++          </div>
++        )}
+       </div>
+ 
+       {result && (
+diff --git a/src/pages/ModelSettingsPage.tsx b/src/pages/ModelSettingsPage.tsx
+index 268f59e..19baa7a 100644
+--- a/src/pages/ModelSettingsPage.tsx
++++ b/src/pages/ModelSettingsPage.tsx
+@@ -41,6 +41,8 @@ export function ModelSettingsPage() {
+   const [settingActiveId, setSettingActiveId] = useState<string | null>(null);
+   const [activeError, setActiveError] = useState<string | null>(null);
+ 
++  const [editingId, setEditingId] = useState<string | null>(null);
++
+   const [usage, setUsage] = useState<UsageSummary | null>(null);
+   const [usageError, setUsageError] = useState(false);
+ 
+@@ -72,10 +74,15 @@ export function ModelSettingsPage() {
+   async function handleSave(e: React.FormEvent) {
+     e.preventDefault();
+     const { providerName, baseUrl, apiKey, modelName, apiType } = form;
+-    if (!providerName.trim() || !baseUrl.trim() || !apiKey.trim() || !modelName.trim()) {
++    if (!providerName.trim() || !baseUrl.trim() || !modelName.trim()) {
+       setSaveMsg({ ok: false, text: '所有字段均为必填项。' });
+       return;
+     }
++    // New config requires a key; editing allows blank (= preserve existing).
++    if (!editingId && !apiKey.trim()) {
++      setSaveMsg({ ok: false, text: 'API Key 为必填项。' });
++      return;
++    }
+     setSaving(true);
+     setSaveMsg(null);
+     try {
+@@ -85,9 +92,11 @@ export function ModelSettingsPage() {
+         apiKey.trim(),
+         modelName.trim(),
+         apiType,
++        editingId ?? undefined,
+       );
+-      setSaveMsg({ ok: true, text: `配置已保存（id: ${newId}）` });
++      setSaveMsg({ ok: true, text: `配置已${editingId ? '更新' : '保存'}（id: ${newId}）` });
+       setForm(INITIAL_FORM);
++      setEditingId(null);
+       loadConfigs();
+     } catch (err) {
+       setSaveMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
+@@ -115,6 +124,24 @@ export function ModelSettingsPage() {
+     }
+   }
+ 
++  function handleEdit(cfg: AiModelConfigView) {
++    setEditingId(cfg.id);
++    setForm({
++      providerName: cfg.providerName,
++      baseUrl: cfg.baseUrl,
++      apiKey: '', // blank — user must re-enter to change; blank = preserve existing
++      modelName: cfg.modelName,
++      apiType: cfg.apiType as ApiType,
++    });
++    setSaveMsg(null);
++  }
++
++  function handleCancelEdit() {
++    setEditingId(null);
++    setForm(INITIAL_FORM);
++    setSaveMsg(null);
++  }
++
+   async function handleSetActive(configId: string) {
+     setSettingActiveId(configId);
+     setActiveError(null);
+@@ -163,9 +190,9 @@ export function ModelSettingsPage() {
+         )}
+       </div>
+ 
+-      {/* New config form */}
++      {/* New / edit config form */}
+       <div className="panel">
+-        <h2>新增配置</h2>
++        <h2>{editingId ? '编辑配置' : '新增配置'}</h2>
+         <form onSubmit={handleSave}>
+           <div style={{ display: 'grid', gap: '8px', maxWidth: '480px' }}>
+             <label>
+@@ -192,7 +219,7 @@ export function ModelSettingsPage() {
+                 type="password"
+                 value={form.apiKey}
+                 onChange={field('apiKey')}
+-                placeholder="sk-..."
++                placeholder={editingId ? '（留空保留原 Key，输入新 Key 以替换）' : 'sk-...'}
+                 autoComplete="off"
+                 disabled={saving}
+               />
+@@ -214,9 +241,16 @@ export function ModelSettingsPage() {
+               </select>
+             </label>
+           </div>
+-          <button className="primary" type="submit" disabled={saving} style={{ marginTop: '12px' }}>
+-            {saving ? '保存中...' : '保存配置'}
+-          </button>
++          <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
++            <button className="primary" type="submit" disabled={saving}>
++              {saving ? '保存中...' : editingId ? '更新配置' : '保存配置'}
++            </button>
++            {editingId && (
++              <button type="button" onClick={handleCancelEdit} disabled={saving}>
++                取消编辑
++              </button>
++            )}
++          </div>
+         </form>
+         {saveMsg && (
+           <p style={{ color: saveMsg.ok ? 'green' : 'crimson', marginTop: '8px' }}>
+@@ -259,9 +293,12 @@ export function ModelSettingsPage() {
+               <p style={{ margin: '2px 0', fontSize: '0.9em' }}>
+                 模型: <b>{cfg.modelName}</b>&nbsp;({cfg.apiType})
+               </p>
+-              <p style={{ margin: '2px 0 10px', fontSize: '0.9em' }}>
++              <p style={{ margin: '2px 0', fontSize: '0.9em' }}>
+                 Key: <code>{cfg.maskedApiKey}</code>
+               </p>
++              <p style={{ margin: '2px 0 10px', fontSize: '0.75em', color: '#888' }}>
++                诊断: {cfg.keyDiagnostic}
++              </p>
+               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                 <button onClick={() => handleTest(cfg.id)} disabled={isTesting}>
+                   {isTesting ? '测试中...' : '测试连接'}
+@@ -271,6 +308,9 @@ export function ModelSettingsPage() {
+                     {isSettingActive ? '设置中...' : '设为当前'}
+                   </button>
+                 )}
++                <button onClick={() => handleEdit(cfg)} disabled={editingId === cfg.id}>
++                  {editingId === cfg.id ? '编辑中...' : '编辑'}
++                </button>
+               </div>
+               {testResult && (
+                 <p

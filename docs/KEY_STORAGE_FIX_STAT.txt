@@ -1,0 +1,6 @@
+ src-tauri/src/commands.rs       | 27 ++++++++++++++++---
+ src-tauri/src/models.rs         |  6 ++++-
+ src-tauri/src/repository.rs     | 12 +++++++++
+ src/lib/types.ts                |  2 ++
+ src/pages/ModelSettingsPage.tsx | 58 ++++++++++++++++++++++++++++++++++-------
+ 5 files changed, 91 insertions(+), 14 deletions(-)

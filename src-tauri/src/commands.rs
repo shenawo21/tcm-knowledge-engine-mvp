@@ -164,12 +164,22 @@ pub async fn process_with_ai(
     }
 
     // Cache miss — call API (no lock held during await)
-    let (result, input_tokens, output_tokens) =
-        ai_processor::process(&trimmed, config_opt).await?;
+    let outcome = ai_processor::process(&trimmed, config_opt).await?;
+    let (input_tokens, output_tokens) = (outcome.input_tokens, outcome.output_tokens);
 
-    // Write cache + log — failure here is non-fatal
+    // Log usage regardless of parse outcome — the API was called and cost was incurred.
     if let Ok(conn) = state.db.lock() {
         let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
+        let _ = repository::log_ai_usage(
+            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
+        );
+    }
+
+    // Propagate content-level error after usage is logged.
+    let result = outcome.result?;
+
+    // Write cache only on successful parse — never cache truncated or malformed JSON.
+    if let Ok(conn) = state.db.lock() {
         if let Ok(json) = serde_json::to_string(&result) {
             let _ = repository::save_exact_cache(
                 &conn,
@@ -177,16 +187,13 @@ pub async fn process_with_ai(
                 ai_processor::PROMPT_VERSION,
                 pt,
                 &api_type_str,
-                1200,
+                1800,
                 &model_name,
                 &json,
                 input_tokens,
                 output_tokens,
             );
         }
-        let _ = repository::log_ai_usage(
-            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
-        );
     }
 
     Ok(result)
@@ -222,9 +229,6 @@ pub fn save_ai_model_config(
     if base_url.is_empty() {
         return Err("base_url is required".into());
     }
-    if api_key.is_empty() {
-        return Err("api_key is required".into());
-    }
     if model_name.is_empty() {
         return Err("model_name is required".into());
     }
@@ -233,6 +237,28 @@ pub fn save_ai_model_config(
             "api_type must be chat_completions or responses, got: {api_type}"
         ));
     }
+    // Saving a masked key would silently break authentication.
+    if api_key.contains("****") {
+        return Err(
+            "API Key 无效：不能保存脱敏格式（如 sk-****xxxx），请输入完整 Key。".into(),
+        );
+    }
+    // When editing (id provided) and key left blank → preserve the existing key from DB.
+    let resolved_key: String = if api_key.is_empty() {
+        match id.as_deref() {
+            Some(existing_id) => {
+                let conn = state.db.lock().map_err(lock_err)?;
+                let existing = repository::get_ai_model_config_by_id(&conn, existing_id)
+                    .map_err(db_err)?
+                    .ok_or_else(|| format!("config not found: {existing_id}"))?;
+                existing.api_key
+                // conn (MutexGuard) dropped here
+            }
+            None => return Err("api_key is required".into()),
+        }
+    } else {
+        api_key.to_string()
+    };
 
     let conn = state.db.lock().map_err(lock_err)?;
     repository::save_ai_model_config(
@@ -240,7 +266,7 @@ pub fn save_ai_model_config(
         id.as_deref(),
         provider_name,
         base_url,
-        api_key,
+        &resolved_key,
         model_name,
         api_type,
     )

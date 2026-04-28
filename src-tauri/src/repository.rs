@@ -552,6 +552,17 @@ pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
 
 // ─── ai_model_config ─────────────────────────────────────────────────────────
 
+fn make_key_diagnostic(key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        return "present=false".to_string();
+    }
+    let len = key.chars().count();
+    let prefix: String = key.chars().take(8).collect();
+    let last4: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    format!("present=true len={} prefix={} last4={}", len, prefix, last4)
+}
+
 fn mask_api_key(key: &str) -> String {
     let key = key.trim();
     let char_count = key.chars().count();
@@ -573,6 +584,7 @@ fn mask_api_key(key: &str) -> String {
 fn to_config_view(row: AiModelConfigRow) -> AiModelConfigView {
     AiModelConfigView {
         masked_api_key: mask_api_key(&row.api_key),
+        key_diagnostic: make_key_diagnostic(&row.api_key),
         id: row.id,
         provider_name: row.provider_name,
         base_url: row.base_url,

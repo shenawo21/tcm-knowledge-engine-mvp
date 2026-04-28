@@ -1,0 +1,8 @@
+ src-tauri/src/ai_processor.rs   | 55 +++++++++++++++++++++++++++++---------
+ src-tauri/src/commands.rs       | 48 ++++++++++++++++++++++++++--------
+ src-tauri/src/models.rs         | 15 ++++++++++-
+ src-tauri/src/repository.rs     | 12 +++++++++
+ src/lib/types.ts                |  2 ++
+ src/pages/IngestionPage.tsx     | 16 +++++++++++-
+ src/pages/ModelSettingsPage.tsx | 58 ++++++++++++++++++++++++++++++++++-------
+ 7 files changed, 172 insertions(+), 34 deletions(-)

@@ -60,7 +60,21 @@ export function IngestionPage() {
         {status.kind === 'done' && (
           <p>已写入数据库（task = {status.taskId}）。切到「知识库」页查看。</p>
         )}
-        {status.kind === 'error' && <p style={{ color: 'crimson' }}>错误：{status.message}</p>}
+        {status.kind === 'error' && (
+          <div style={{ color: 'crimson' }}>
+            <p>
+              错误：
+              {status.message.length > 300
+                ? status.message.slice(0, 300) + '…（详情已截断）'
+                : status.message}
+            </p>
+            {(status.message.includes('max_tokens') || status.message.includes('截断')) && (
+              <p style={{ fontSize: '0.9em', marginTop: '4px' }}>
+                建议：缩短输入文本（500 字以内）后重试，或分段处理。
+              </p>
+            )}
+          </div>
+        )}
       </div>
 
       {result && (

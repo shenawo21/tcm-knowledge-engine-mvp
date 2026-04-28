@@ -5,13 +5,13 @@ use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::models::{AiModelConfigRow, AiResult, TestConnectionResult};
+use crate::models::{AiCallOutcome, AiModelConfigRow, AiResult, TestConnectionResult};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_TOKENS: u32 = 1200;
-pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V1";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TOKENS: u32 = 1800;
+pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V2";
 
 const SYSTEM_PROMPT: &str = r#"You are a TCM (Traditional Chinese Medicine) knowledge extraction assistant.
 Given a Chinese medicine text, extract entities and relationships and return ONLY a JSON object with this exact structure (no markdown, no code blocks):
@@ -42,7 +42,8 @@ Given a Chinese medicine text, extract entities and relationships and return ONL
 Review levels: A = classical source or well-evidenced, B = modern/reasonable, C = uncertain or low-quality source.
 Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reasonably inferred, will be flagged for human review; < 0.50 = uncertain, omit unless significant. Do not fabricate entities or relationships; fewer honest entries are better than more invented ones.
 For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
-Return ONLY valid JSON. No explanation, no markdown wrapping."#;
+STRICT OUTPUT LIMITS (prioritise the most important items to stay within token budget): entities ≤ 20, relations ≤ 20, western_mapping ≤ 5, key_points ≤ 5. The JSON must be complete and valid — no trailing commas, no truncation, no ellipsis. If you cannot fit all items, drop the least important ones entirely.
+Return ONLY valid JSON. No explanation, no markdown, no code fences."#;
 
 pub fn normalize_input(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -69,11 +70,12 @@ pub fn compute_cache_key(
 }
 
 /// Primary AI processing — DB config takes priority, falls back to env vars.
-/// Returns (AiResult, input_tokens, output_tokens).
+/// Returns AiCallOutcome which always carries token usage (even on content failure).
+/// Outer Err is reserved for network/transport failures where no usage data exists.
 pub async fn process(
     input_text: &str,
     config: Option<AiModelConfigRow>,
-) -> Result<(AiResult, i64, i64), String> {
+) -> Result<AiCallOutcome, String> {
     let (api_key, base_url, model_name, api_type) = resolve_credentials(config)?;
     make_ai_request(input_text, &api_key, &base_url, &model_name, &api_type).await
 }
@@ -206,7 +208,7 @@ async fn make_ai_request(
     base_url: &str,
     model_name: &str,
     api_type: &str,
-) -> Result<(AiResult, i64, i64), String> {
+) -> Result<AiCallOutcome, String> {
     let client = build_client()?;
     let url = build_endpoint_url(base_url, api_type);
 
@@ -249,7 +251,7 @@ async fn make_ai_request(
         .await
         .map_err(|e| format!("解析 API 响应失败: {e}"))?;
 
-    // Parse usage — failure here must not interrupt the main flow.
+    // Parse usage — failure must not interrupt the main flow.
     let input_tokens = response_value["usage"]["prompt_tokens"]
         .as_i64()
         .or_else(|| response_value["usage"]["input_tokens"].as_i64())
@@ -259,11 +261,40 @@ async fn make_ai_request(
         .or_else(|| response_value["usage"]["output_tokens"].as_i64())
         .unwrap_or(0);
 
+    // Check finish_reason before attempting JSON parse.
+    let finish_reason = response_value["choices"][0]["finish_reason"]
+        .as_str()
+        .or_else(|| response_value["incomplete_details"]["reason"].as_str())
+        .unwrap_or("");
+
+    if finish_reason == "length" {
+        return Ok(AiCallOutcome {
+            result: Err(
+                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。"
+                    .to_string(),
+            ),
+            input_tokens,
+            output_tokens,
+        });
+    }
+
     let content = extract_content(&response_value, api_type)?;
     let clean = strip_markdown(&content);
 
-    let result = serde_json::from_str::<AiResult>(clean)
-        .map_err(|e| format!("解析 AI 输出 JSON 失败: {e}\n原始内容: {content}"))?;
+    let result = match serde_json::from_str::<AiResult>(clean) {
+        Ok(r) => r,
+        Err(e) => {
+            let preview: String = content.chars().take(500).collect();
+            let suffix = if content.chars().count() > 500 { "…（已截断）" } else { "" };
+            return Ok(AiCallOutcome {
+                result: Err(format!(
+                    "解析 AI 输出 JSON 失败: {e}\n预览（前500字符）:\n{preview}{suffix}"
+                )),
+                input_tokens,
+                output_tokens,
+            });
+        }
+    };
 
-    Ok((result, input_tokens, output_tokens))
+    Ok(AiCallOutcome { result: Ok(result), input_tokens, output_tokens })
 }

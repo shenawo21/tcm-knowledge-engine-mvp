@@ -118,6 +118,15 @@ pub struct EntityDetail {
     pub incoming: Vec<RelationView>,
 }
 
+/// Internal outcome of one AI API call.
+/// Outer Err = network/transport failure (no usage data available).
+/// Outer Ok with inner Err = API responded but content failed (usage data present, must be logged).
+pub struct AiCallOutcome {
+    pub result: Result<AiResult, String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
 /// Internal row — NOT Serialize; api_key must never reach the frontend.
 #[derive(Debug)]
 pub struct AiModelConfigRow {
@@ -132,7 +141,9 @@ pub struct AiModelConfigRow {
     pub updated_at: Option<String>,
 }
 
-/// Frontend-safe view — api_key is replaced by masked_api_key.
+/// Frontend-safe view — api_key is replaced by masked_api_key and key_diagnostic.
+/// key_diagnostic exposes only length, 8-char prefix, and last-4 suffix for debugging;
+/// the full key is never included.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiModelConfigView {
@@ -140,6 +151,8 @@ pub struct AiModelConfigView {
     pub provider_name: String,
     pub base_url: String,
     pub masked_api_key: String,
+    /// Diagnostic only: "present=true len=X prefix=Y last4=Z" — never the full key.
+    pub key_diagnostic: String,
     pub model_name: String,
     pub api_type: String,
     pub is_active: bool,

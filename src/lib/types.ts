@@ -96,6 +96,8 @@ export interface AiModelConfigView {
   providerName: string;
   baseUrl: string;
   maskedApiKey: string;
+  /** Diagnostic only: never contains the full key. */
+  keyDiagnostic: string;
   modelName: string;
   apiType: string;
   isActive: boolean;
