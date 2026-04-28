@@ -1,0 +1,53 @@
+{
+  "diagnostic_date": "2026-04-28",
+  "environment": {
+    "python": "3.13.2",
+    "litellm": "1.83.14",
+    "litellm_exe": "C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python313\\Scripts\\litellm.exe",
+    "http_proxy": "http://127.0.0.1:7897",
+    "https_proxy": "detected (same proxy)",
+    "OPENROUTER_API_KEY": "present=true len=73 prefix=sk-or-v1 last4=7bba",
+    "LITELLM_MASTER_KEY": "present=false (not in shell env; hardcoded in config.yaml as sk-local-litellm)",
+    "config_yaml": "exists at litellm/config.yaml",
+    "litellm_env": ".env file not found at litellm/.env"
+  },
+  "config_yaml_summary": {
+    "model_name": "claude-sonnet",
+    "model": "openrouter/anthropic/claude-sonnet-4.6",
+    "api_key": "os.environ/OPENROUTER_API_KEY",
+    "api_base": "https://openrouter.ai/api/v1",
+    "master_key": "sk-local-litellm (hardcoded in config.yaml)"
+  },
+  "startup": {
+    "port": 4010,
+    "status": "SUCCESS",
+    "log_line": "Uvicorn running on http://0.0.0.0:4010"
+  },
+  "requests": {
+    "GET_health_with_proxy": {
+      "status": 502,
+      "note": "curl routed through http_proxy=http://127.0.0.1:7897; proxy returned 502"
+    },
+    "GET_health_noproxy": {
+      "status": 401,
+      "body": "{\"error\":{\"message\":\"Authentication Error, No api key passed in.\",\"type\":\"auth_error\",\"param\":\"None\",\"code\":\"401\"}}",
+      "note": "LiteLLM /health requires Authorization header; functional but returns 401 on unauthenticated health check"
+    },
+    "GET_v1_models_noproxy": {
+      "status": 200,
+      "body": "{\"data\":[{\"id\":\"claude-sonnet\",\"object\":\"model\",\"created\":1677610602,\"owned_by\":\"openai\"}],\"object\":\"list\"}",
+      "note": "Model list returned correctly"
+    },
+    "POST_v1_chat_completions_noproxy": {
+      "status": 200,
+      "max_tokens": 3,
+      "finish_reason": "length",
+      "content": "Hello! It",
+      "tokens": {"prompt": 8, "completion": 3, "total": 11},
+      "cost_usd": 0.000069,
+      "provider": "Google",
+      "note": "API call successful; routed through OpenRouter to Claude Sonnet 4.6"
+    }
+  },
+  "root_cause": "http_proxy env var (http://127.0.0.1:7897) intercepts all HTTP requests including localhost targets; App Rust HTTP client (reqwest) likely uses system proxy, so requests to http://127.0.0.1:4000 are forwarded to Clash/VPN proxy which returns 502"
+}
