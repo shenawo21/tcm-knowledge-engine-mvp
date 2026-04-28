@@ -176,3 +176,41 @@ pub struct UsageSummary {
     pub cache_hit_count: i64,
     pub today_cost_usd: f64,
 }
+
+/// One ingestion_chunks row returned to the frontend.
+/// `chunk_text` is omitted to reduce IPC payload; use `text_preview` + `char_count` instead.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkRow {
+    pub chunk_id: String,
+    pub task_id: String,
+    pub chunk_index: i64,
+    pub char_count: i64,
+    pub text_preview: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Per-status counts for a parent task, used in the task list view.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkStatusSummary {
+    pub task_id: String,
+    pub task_created_at: Option<String>,
+    pub text_preview: String,
+    pub total: i64,
+    pub pending: i64,
+    pub running: i64,
+    pub done: i64,
+    pub failed: i64,
+}
+
+/// Returned by create_chunked_task.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChunkedTaskResult {
+    pub task_id: String,
+    pub chunk_ids: Vec<String>,
+}

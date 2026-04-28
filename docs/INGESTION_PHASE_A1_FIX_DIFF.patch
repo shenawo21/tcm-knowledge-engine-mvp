@@ -1,0 +1,676 @@
+diff --git a/src-tauri/src/ai_processor.rs b/src-tauri/src/ai_processor.rs
+index 2556576..fe2eaa2 100644
+--- a/src-tauri/src/ai_processor.rs
++++ b/src-tauri/src/ai_processor.rs
+@@ -262,8 +262,7 @@ async fn make_ai_request(
+     if finish_reason == "length" {
+         return Ok(AiCallOutcome {
+             result: Err(
+-                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。"
+-                    .to_string(),
++                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。".to_string(),
+             ),
+             input_tokens,
+             output_tokens,
+@@ -277,7 +276,11 @@ async fn make_ai_request(
+         Ok(r) => r,
+         Err(e) => {
+             let preview: String = content.chars().take(500).collect();
+-            let suffix = if content.chars().count() > 500 { "…（已截断）" } else { "" };
++            let suffix = if content.chars().count() > 500 {
++                "…（已截断）"
++            } else {
++                ""
++            };
+             return Ok(AiCallOutcome {
+                 result: Err(format!(
+                     "解析 AI 输出 JSON 失败: {e}\n预览（前500字符）:\n{preview}{suffix}"
+@@ -288,5 +291,9 @@ async fn make_ai_request(
+         }
+     };
+ 
+-    Ok(AiCallOutcome { result: Ok(result), input_tokens, output_tokens })
++    Ok(AiCallOutcome {
++        result: Ok(result),
++        input_tokens,
++        output_tokens,
++    })
+ }
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index 5627685..615e507 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -3,8 +3,8 @@ use tauri::State;
+ use crate::ai_processor;
+ use crate::db::AppState;
+ use crate::models::{
+-    AiModelConfigView, AiResult, EntityDetail, EntityListItem, IngestionTaskRow,
+-    TestConnectionResult, UsageSummary,
++    AiModelConfigView, AiResult, ChunkRow, ChunkStatusSummary, CreateChunkedTaskResult,
++    EntityDetail, EntityListItem, IngestionTaskRow, TestConnectionResult, UsageSummary,
+ };
+ use crate::repository;
+ 
+@@ -155,7 +155,13 @@ pub async fn process_with_ai(
+         if let Ok(result) = serde_json::from_str::<AiResult>(&cached_json) {
+             if let Ok(conn) = state.db.lock() {
+                 let _ = repository::log_ai_usage(
+-                    &conn, &model_name, pt, input_tokens, output_tokens, 0.0, true,
++                    &conn,
++                    &model_name,
++                    pt,
++                    input_tokens,
++                    output_tokens,
++                    0.0,
++                    true,
+                 );
+             }
+             return Ok(result);
+@@ -171,7 +177,13 @@ pub async fn process_with_ai(
+     if let Ok(conn) = state.db.lock() {
+         let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
+         let _ = repository::log_ai_usage(
+-            &conn, &model_name, pt, input_tokens, output_tokens, cost, false,
++            &conn,
++            &model_name,
++            pt,
++            input_tokens,
++            output_tokens,
++            cost,
++            false,
+         );
+     }
+ 
+@@ -239,9 +251,7 @@ pub fn save_ai_model_config(
+     }
+     // Saving a masked key would silently break authentication.
+     if api_key.contains("****") {
+-        return Err(
+-            "API Key 无效：不能保存脱敏格式（如 sk-****xxxx），请输入完整 Key。".into(),
+-        );
++        return Err("API Key 无效：不能保存脱敏格式（如 sk-****xxxx），请输入完整 Key。".into());
+     }
+     // When editing (id provided) and key left blank → preserve the existing key from DB.
+     let resolved_key: String = if api_key.is_empty() {
+@@ -312,3 +322,237 @@ pub async fn test_ai_model_connection(
+     let config = config.ok_or_else(|| format!("config not found: {config_id}"))?;
+     ai_processor::test_connection(&config).await
+ }
++
++// ─── chunked ingestion commands ───────────────────────────────────────────────
++
++#[tauri::command]
++pub fn create_chunked_task(
++    state: State<'_, AppState>,
++    input_text: String,
++    chunk_texts: Vec<String>,
++) -> Result<CreateChunkedTaskResult, String> {
++    let trimmed = input_text.trim();
++    if trimmed.is_empty() {
++        return Err("input_text is empty".into());
++    }
++    if chunk_texts.is_empty() {
++        return Err("chunk_texts must not be empty".into());
++    }
++    for (i, ct) in chunk_texts.iter().enumerate() {
++        if ct.trim().is_empty() {
++            return Err(format!("chunk_texts[{i}] is empty"));
++        }
++        if ct.chars().count() > MAX_INPUT_TEXT_CHARS {
++            return Err(format!(
++                "chunk_texts[{i}] exceeds {MAX_INPUT_TEXT_CHARS} characters"
++            ));
++        }
++    }
++    let conn = state.db.lock().map_err(lock_err)?;
++    repository::create_chunked_task(&conn, trimmed, &chunk_texts).map_err(db_err)
++}
++
++#[tauri::command]
++pub fn get_task_chunks(
++    state: State<'_, AppState>,
++    task_id: String,
++) -> Result<Vec<ChunkRow>, String> {
++    if task_id.trim().is_empty() {
++        return Err("task_id is required".into());
++    }
++    let conn = state.db.lock().map_err(lock_err)?;
++    repository::get_task_chunks(&conn, &task_id).map_err(db_err)
++}
++
++#[tauri::command]
++pub fn list_chunked_tasks(
++    state: State<'_, AppState>,
++    limit: Option<i64>,
++    offset: Option<i64>,
++) -> Result<Vec<ChunkStatusSummary>, String> {
++    let conn = state.db.lock().map_err(lock_err)?;
++    repository::list_chunked_tasks(&conn, limit.unwrap_or(50), offset.unwrap_or(0)).map_err(db_err)
++}
++
++/// Process a single chunk by chunk_id.
++/// - status=done + result_json present → return saved result immediately, no API call.
++/// - status=running → Err("chunk is already running"), no API call.
++/// - status=failed → Err("chunk is failed; retry is not implemented in Phase A1"), no API call.
++/// - status=pending → attempt atomic pending→running via set_chunk_running:
++///     - claimed (true)  → proceed to AI call.
++///     - not claimed (false) → re-read status and apply the rules above; no API call.
++#[tauri::command]
++pub async fn process_chunk(
++    state: State<'_, AppState>,
++    chunk_id: String,
++) -> Result<AiResult, String> {
++    if chunk_id.trim().is_empty() {
++        return Err("chunk_id is required".into());
++    }
++
++    // Helper: read current status + text (lock released immediately)
++    let read_chunk = |state: &State<'_, AppState>| -> Result<(String, String, String), String> {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::get_chunk_for_processing(&conn, &chunk_id)
++            .map_err(db_err)?
++            .ok_or_else(|| format!("chunk not found: {chunk_id}"))
++    };
++
++    // Helper: return saved result for a done chunk (no API call)
++    let return_done = |state: &State<'_, AppState>| -> Result<AiResult, String> {
++        let conn = state.db.lock().map_err(lock_err)?;
++        let json: Option<String> = conn
++            .query_row(
++                "SELECT result_json FROM ingestion_chunks WHERE chunk_id = ?1",
++                rusqlite::params![chunk_id],
++                |row| row.get(0),
++            )
++            .map_err(db_err)?;
++        match json.and_then(|j| serde_json::from_str::<AiResult>(&j).ok()) {
++            Some(r) => Ok(r),
++            None => Err("chunk is done but result_json is missing or corrupt".into()),
++        }
++    };
++
++    let (chunk_text, status, _task_id) = read_chunk(&state)?;
++
++    // Fast-path for terminal / in-flight states
++    match status.as_str() {
++        "done" => return return_done(&state),
++        "running" => return Err("chunk is already running".into()),
++        "failed" => return Err("chunk is failed; retry is not implemented in Phase A1".into()),
++        _ => {} // "pending" — attempt to claim below
++    }
++
++    // Atomic pending → running claim
++    let claimed = {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::set_chunk_running(&conn, &chunk_id).map_err(db_err)?
++    };
++
++    if !claimed {
++        // Another call changed the status between our read and the UPDATE.
++        // Re-read and apply terminal rules; never call AI.
++        let (_, new_status, _) = read_chunk(&state)?;
++        return match new_status.as_str() {
++            "done" => return_done(&state),
++            "running" => Err("chunk is already running".into()),
++            "failed" => Err("chunk is failed; retry is not implemented in Phase A1".into()),
++            other => Err(format!(
++                "unexpected chunk status after failed claim: {other}"
++            )),
++        };
++    }
++
++    // Delegate to existing process_with_ai logic (reuses cache + usage log)
++    let pt = "chunk";
++    let normalized = ai_processor::normalize_input(&chunk_text);
++
++    let (config_opt, model_name, api_type_str) = {
++        let conn = state.db.lock().map_err(lock_err)?;
++        let config = repository::get_active_ai_model_full(&conn).map_err(db_err)?;
++        let (mn, at) = if let Some(ref c) = config {
++            (c.model_name.clone(), c.api_type.clone())
++        } else {
++            let mn = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
++            (mn, "chat_completions".to_string())
++        };
++        (config, mn, at)
++    };
++
++    let cache_key = ai_processor::compute_cache_key(
++        ai_processor::PROMPT_VERSION,
++        pt,
++        &model_name,
++        &api_type_str,
++        &normalized,
++    );
++
++    {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::ensure_ai_cost_tables(&conn).map_err(db_err)?;
++    }
++
++    // Check exact cache
++    let cached = {
++        let conn = state.db.lock().map_err(lock_err)?;
++        repository::get_exact_cache(&conn, &cache_key).map_err(db_err)?
++    };
++
++    if let Some((cached_json, input_tokens, output_tokens)) = cached {
++        if let Ok(result) = serde_json::from_str::<AiResult>(&cached_json) {
++            if let Ok(conn) = state.db.lock() {
++                let _ = repository::log_ai_usage(
++                    &conn,
++                    &model_name,
++                    pt,
++                    input_tokens,
++                    output_tokens,
++                    0.0,
++                    true,
++                );
++            }
++            if let Ok(json) = serde_json::to_string(&result) {
++                if let Ok(conn) = state.db.lock() {
++                    let _ = repository::set_chunk_done(&conn, &chunk_id, &json);
++                }
++            }
++            return Ok(result);
++        }
++    }
++
++    // Cache miss — call API
++    let outcome = match ai_processor::process(&chunk_text, config_opt).await {
++        Ok(o) => o,
++        Err(e) => {
++            if let Ok(conn) = state.db.lock() {
++                let _ = repository::set_chunk_failed(&conn, &chunk_id, &e);
++            }
++            return Err(e);
++        }
++    };
++    let (input_tokens, output_tokens) = (outcome.input_tokens, outcome.output_tokens);
++
++    if let Ok(conn) = state.db.lock() {
++        let cost = input_tokens as f64 * 0.000003 + output_tokens as f64 * 0.000015;
++        let _ = repository::log_ai_usage(
++            &conn,
++            &model_name,
++            pt,
++            input_tokens,
++            output_tokens,
++            cost,
++            false,
++        );
++    }
++
++    let result = match outcome.result {
++        Ok(r) => r,
++        Err(e) => {
++            if let Ok(conn) = state.db.lock() {
++                let _ = repository::set_chunk_failed(&conn, &chunk_id, &e);
++            }
++            return Err(e);
++        }
++    };
++
++    if let Ok(json) = serde_json::to_string(&result) {
++        if let Ok(conn) = state.db.lock() {
++            let _ = repository::save_exact_cache(
++                &conn,
++                &cache_key,
++                ai_processor::PROMPT_VERSION,
++                pt,
++                &api_type_str,
++                2400,
++                &model_name,
++                &json,
++                input_tokens,
++                output_tokens,
++            );
++            let _ = repository::set_chunk_done(&conn, &chunk_id, &json);
++        }
++    }
++
++    Ok(result)
++}
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 5527ed6..2cea8b6 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -30,6 +30,10 @@ pub fn run() {
+             commands::get_active_ai_model,
+             commands::test_ai_model_connection,
+             commands::get_usage_summary,
++            commands::create_chunked_task,
++            commands::get_task_chunks,
++            commands::list_chunked_tasks,
++            commands::process_chunk,
+         ])
+         .run(tauri::generate_context!())
+         .expect("error while running tauri application");
+diff --git a/src-tauri/src/models.rs b/src-tauri/src/models.rs
+index 2a30ede..3b0399b 100644
+--- a/src-tauri/src/models.rs
++++ b/src-tauri/src/models.rs
+@@ -176,3 +176,41 @@ pub struct UsageSummary {
+     pub cache_hit_count: i64,
+     pub today_cost_usd: f64,
+ }
++
++/// One ingestion_chunks row returned to the frontend.
++/// `chunk_text` is omitted to reduce IPC payload; use `text_preview` + `char_count` instead.
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ChunkRow {
++    pub chunk_id: String,
++    pub task_id: String,
++    pub chunk_index: i64,
++    pub char_count: i64,
++    pub text_preview: String,
++    pub status: String,
++    pub error_message: Option<String>,
++    pub created_at: Option<String>,
++    pub updated_at: Option<String>,
++}
++
++/// Per-status counts for a parent task, used in the task list view.
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ChunkStatusSummary {
++    pub task_id: String,
++    pub task_created_at: Option<String>,
++    pub text_preview: String,
++    pub total: i64,
++    pub pending: i64,
++    pub running: i64,
++    pub done: i64,
++    pub failed: i64,
++}
++
++/// Returned by create_chunked_task.
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CreateChunkedTaskResult {
++    pub task_id: String,
++    pub chunk_ids: Vec<String>,
++}
+diff --git a/src-tauri/src/repository.rs b/src-tauri/src/repository.rs
+index f47c6b1..4a3eff8 100644
+--- a/src-tauri/src/repository.rs
++++ b/src-tauri/src/repository.rs
+@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
+ use uuid::Uuid;
+ 
+ use crate::models::{
+-    AiModelConfigRow, AiModelConfigView, AiResult, EntityDetail, EntityListItem, EntityRow,
+-    IngestionTaskRow, RelationView, UsageSummary,
++    AiModelConfigRow, AiModelConfigView, AiResult, ChunkRow, ChunkStatusSummary,
++    CreateChunkedTaskResult, EntityDetail, EntityListItem, EntityRow, IngestionTaskRow,
++    RelationView, UsageSummary,
+ };
+ 
+ // Entities / relations with confidence >= HIGH_CONFIDENCE_THRESHOLD are considered well-supported.
+@@ -164,10 +165,7 @@ pub fn save_ai_result(
+ 
+     for wm in &ai.western_mapping {
+         // western_mapping always requires human review; source_fact may be expedited but still logged.
+-        let needs_urgent_review = !matches!(
+-            wm.mapping_level.as_deref(),
+-            Some("source_fact")
+-        );
++        let needs_urgent_review = !matches!(wm.mapping_level.as_deref(), Some("source_fact"));
+         let reason = if needs_urgent_review {
+             REASON_WM_REVIEW
+         } else {
+@@ -527,11 +525,8 @@ pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
+         [],
+         |row| row.get(0),
+     )?;
+-    let total_calls: i64 = conn.query_row(
+-        "SELECT COUNT(*) FROM ai_usage_log",
+-        [],
+-        |row| row.get(0),
+-    )?;
++    let total_calls: i64 =
++        conn.query_row("SELECT COUNT(*) FROM ai_usage_log", [], |row| row.get(0))?;
+     let cache_hit_count: i64 = conn.query_row(
+         "SELECT COUNT(*) FROM ai_usage_log WHERE cache_hit = 1",
+         [],
+@@ -559,7 +554,14 @@ fn make_key_diagnostic(key: &str) -> String {
+     }
+     let len = key.chars().count();
+     let prefix: String = key.chars().take(8).collect();
+-    let last4: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
++    let last4: String = key
++        .chars()
++        .rev()
++        .take(4)
++        .collect::<String>()
++        .chars()
++        .rev()
++        .collect();
+     format!("present=true len={} prefix={} last4={}", len, prefix, last4)
+ }
+ 
+@@ -694,3 +696,188 @@ pub fn get_ai_model_config_by_id(
+     )
+     .optional()
+ }
++
++// ─── ingestion_chunks ─────────────────────────────────────────────────────────
++
++/// Ensures ingestion_chunks table exists. Safe to call on any existing database.
++pub fn ensure_chunk_table(conn: &Connection) -> rusqlite::Result<()> {
++    conn.execute_batch(
++        "CREATE TABLE IF NOT EXISTS ingestion_chunks (
++            chunk_id        TEXT PRIMARY KEY,
++            task_id         TEXT NOT NULL,
++            chunk_index     INTEGER NOT NULL,
++            chunk_text_hash TEXT NOT NULL,
++            chunk_text      TEXT NOT NULL,
++            status          TEXT NOT NULL DEFAULT 'pending',
++            result_json     TEXT,
++            error_message   TEXT,
++            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
++            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
++        );
++        CREATE INDEX IF NOT EXISTS idx_chunks_task
++            ON ingestion_chunks(task_id, chunk_index);",
++    )
++}
++
++/// Creates a parent ingestion_task row plus one ingestion_chunks row per chunk text.
++/// Returns task_id and the list of chunk_ids in index order.
++pub fn create_chunked_task(
++    conn: &Connection,
++    input_text: &str,
++    chunk_texts: &[String],
++) -> rusqlite::Result<CreateChunkedTaskResult> {
++    ensure_chunk_table(conn)?;
++    let task_id = create_ingestion_task(conn, "chunked", input_text)?;
++    let now = now_iso();
++    let mut chunk_ids = Vec::with_capacity(chunk_texts.len());
++
++    for (index, text) in chunk_texts.iter().enumerate() {
++        let chunk_id = new_id();
++        let hash = sha256_hex(text);
++        conn.execute(
++            "INSERT INTO ingestion_chunks
++             (chunk_id, task_id, chunk_index, chunk_text_hash, chunk_text, status, created_at, updated_at)
++             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
++            params![chunk_id, task_id, index as i64, hash, text, now],
++        )?;
++        chunk_ids.push(chunk_id);
++    }
++
++    Ok(CreateChunkedTaskResult { task_id, chunk_ids })
++}
++
++/// Returns all chunk rows for a task (status + preview, no full text).
++pub fn get_task_chunks(conn: &Connection, task_id: &str) -> rusqlite::Result<Vec<ChunkRow>> {
++    ensure_chunk_table(conn)?;
++    let mut stmt = conn.prepare(
++        "SELECT chunk_id, task_id, chunk_index,
++                LENGTH(chunk_text),
++                SUBSTR(chunk_text, 1, 50),
++                status, error_message, created_at, updated_at
++         FROM ingestion_chunks
++         WHERE task_id = ?1
++         ORDER BY chunk_index ASC",
++    )?;
++    let rows = stmt.query_map(params![task_id], |row| {
++        Ok(ChunkRow {
++            chunk_id: row.get(0)?,
++            task_id: row.get(1)?,
++            chunk_index: row.get(2)?,
++            char_count: row.get(3)?,
++            text_preview: row.get(4)?,
++            status: row.get(5)?,
++            error_message: row.get(6)?,
++            created_at: row.get(7)?,
++            updated_at: row.get(8)?,
++        })
++    })?;
++    rows.collect()
++}
++
++/// Returns task list with per-status chunk counts.
++pub fn list_chunked_tasks(
++    conn: &Connection,
++    limit: i64,
++    offset: i64,
++) -> rusqlite::Result<Vec<ChunkStatusSummary>> {
++    ensure_chunk_table(conn)?;
++    let mut stmt = conn.prepare(
++        "SELECT
++            t.id,
++            t.created_at,
++            SUBSTR(COALESCE(t.input_text, ''), 1, 40),
++            COUNT(c.chunk_id),
++            SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END),
++            SUM(CASE WHEN c.status = 'running' THEN 1 ELSE 0 END),
++            SUM(CASE WHEN c.status = 'done'    THEN 1 ELSE 0 END),
++            SUM(CASE WHEN c.status = 'failed'  THEN 1 ELSE 0 END)
++         FROM ingestion_task t
++         LEFT JOIN ingestion_chunks c ON c.task_id = t.id
++         WHERE t.task_type = 'chunked'
++         GROUP BY t.id
++         ORDER BY t.created_at DESC
++         LIMIT ?1 OFFSET ?2",
++    )?;
++    let rows = stmt.query_map(params![limit, offset], |row| {
++        Ok(ChunkStatusSummary {
++            task_id: row.get(0)?,
++            task_created_at: row.get(1)?,
++            text_preview: row.get(2)?,
++            total: row.get(3)?,
++            pending: row.get(4)?,
++            running: row.get(5)?,
++            done: row.get(6)?,
++            failed: row.get(7)?,
++        })
++    })?;
++    rows.collect()
++}
++
++/// Reads a single chunk's text for use in process_chunk.
++pub fn get_chunk_for_processing(
++    conn: &Connection,
++    chunk_id: &str,
++) -> rusqlite::Result<Option<(String, String, String)>> {
++    // Returns (chunk_text, status, task_id)
++    conn.query_row(
++        "SELECT chunk_text, status, task_id FROM ingestion_chunks WHERE chunk_id = ?1",
++        params![chunk_id],
++        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
++    )
++    .optional()
++}
++
++/// Atomically advances chunk from pending → running.
++/// Returns true only if the row was in 'pending' state and has been claimed.
++/// Returns false if the row was already running/done/failed (or not found), meaning
++/// the caller must NOT proceed to call the AI.
++pub fn set_chunk_running(conn: &Connection, chunk_id: &str) -> rusqlite::Result<bool> {
++    let now = now_iso();
++    let n = conn.execute(
++        "UPDATE ingestion_chunks SET status = 'running', updated_at = ?1
++         WHERE chunk_id = ?2 AND status = 'pending'",
++        params![now, chunk_id],
++    )?;
++    Ok(n > 0)
++}
++
++/// Writes successful result for a chunk.
++pub fn set_chunk_done(
++    conn: &Connection,
++    chunk_id: &str,
++    result_json: &str,
++) -> rusqlite::Result<()> {
++    let now = now_iso();
++    conn.execute(
++        "UPDATE ingestion_chunks
++         SET status = 'done', result_json = ?1, error_message = NULL, updated_at = ?2
++         WHERE chunk_id = ?3",
++        params![result_json, now, chunk_id],
++    )?;
++    Ok(())
++}
++
++/// Writes failure for a chunk.
++pub fn set_chunk_failed(
++    conn: &Connection,
++    chunk_id: &str,
++    error_message: &str,
++) -> rusqlite::Result<()> {
++    let now = now_iso();
++    conn.execute(
++        "UPDATE ingestion_chunks
++         SET status = 'failed', error_message = ?1, updated_at = ?2
++         WHERE chunk_id = ?3",
++        params![error_message, now, chunk_id],
++    )?;
++    Ok(())
++}
++
++// ─── internal helpers ─────────────────────────────────────────────────────────
++
++fn sha256_hex(s: &str) -> String {
++    use sha2::{Digest, Sha256};
++    let mut h = Sha256::new();
++    h.update(s.as_bytes());
++    hex::encode(h.finalize())
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 1b4b99b..4eee677 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -117,3 +117,31 @@ export interface UsageSummary {
+   totalCalls: number;
+   cacheHitCount: number;
+ }
++
++export interface ChunkRow {
++  chunkId: string;
++  taskId: string;
++  chunkIndex: number;
++  charCount: number;
++  textPreview: string;
++  status: 'pending' | 'running' | 'done' | 'failed';
++  errorMessage: string | null;
++  createdAt: string | null;
++  updatedAt: string | null;
++}
++
++export interface ChunkStatusSummary {
++  taskId: string;
++  taskCreatedAt: string | null;
++  textPreview: string;
++  total: number;
++  pending: number;
++  running: number;
++  done: number;
++  failed: number;
++}
++
++export interface CreateChunkedTaskResult {
++  taskId: string;
++  chunkIds: string[];
++}

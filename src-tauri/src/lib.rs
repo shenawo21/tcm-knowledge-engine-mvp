@@ -30,6 +30,10 @@ pub fn run() {
             commands::get_active_ai_model,
             commands::test_ai_model_connection,
             commands::get_usage_summary,
+            commands::create_chunked_task,
+            commands::get_task_chunks,
+            commands::list_chunked_tasks,
+            commands::process_chunk,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

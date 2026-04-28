@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use uuid::Uuid;
 
 use crate::models::{
-    AiModelConfigRow, AiModelConfigView, AiResult, EntityDetail, EntityListItem, EntityRow,
-    IngestionTaskRow, RelationView, UsageSummary,
+    AiModelConfigRow, AiModelConfigView, AiResult, ChunkRow, ChunkStatusSummary,
+    CreateChunkedTaskResult, EntityDetail, EntityListItem, EntityRow, IngestionTaskRow,
+    RelationView, UsageSummary,
 };
 
 // Entities / relations with confidence >= HIGH_CONFIDENCE_THRESHOLD are considered well-supported.
@@ -164,10 +165,7 @@ pub fn save_ai_result(
 
     for wm in &ai.western_mapping {
         // western_mapping always requires human review; source_fact may be expedited but still logged.
-        let needs_urgent_review = !matches!(
-            wm.mapping_level.as_deref(),
-            Some("source_fact")
-        );
+        let needs_urgent_review = !matches!(wm.mapping_level.as_deref(), Some("source_fact"));
         let reason = if needs_urgent_review {
             REASON_WM_REVIEW
         } else {
@@ -527,11 +525,8 @@ pub fn get_usage_summary(conn: &Connection) -> rusqlite::Result<UsageSummary> {
         [],
         |row| row.get(0),
     )?;
-    let total_calls: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM ai_usage_log",
-        [],
-        |row| row.get(0),
-    )?;
+    let total_calls: i64 =
+        conn.query_row("SELECT COUNT(*) FROM ai_usage_log", [], |row| row.get(0))?;
     let cache_hit_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM ai_usage_log WHERE cache_hit = 1",
         [],
@@ -559,7 +554,14 @@ fn make_key_diagnostic(key: &str) -> String {
     }
     let len = key.chars().count();
     let prefix: String = key.chars().take(8).collect();
-    let last4: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let last4: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("present=true len={} prefix={} last4={}", len, prefix, last4)
 }
 
@@ -693,4 +695,189 @@ pub fn get_ai_model_config_by_id(
         map_config_row,
     )
     .optional()
+}
+
+// ─── ingestion_chunks ─────────────────────────────────────────────────────────
+
+/// Ensures ingestion_chunks table exists. Safe to call on any existing database.
+pub fn ensure_chunk_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ingestion_chunks (
+            chunk_id        TEXT PRIMARY KEY,
+            task_id         TEXT NOT NULL,
+            chunk_index     INTEGER NOT NULL,
+            chunk_text_hash TEXT NOT NULL,
+            chunk_text      TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            result_json     TEXT,
+            error_message   TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunks_task
+            ON ingestion_chunks(task_id, chunk_index);",
+    )
+}
+
+/// Creates a parent ingestion_task row plus one ingestion_chunks row per chunk text.
+/// Returns task_id and the list of chunk_ids in index order.
+pub fn create_chunked_task(
+    conn: &Connection,
+    input_text: &str,
+    chunk_texts: &[String],
+) -> rusqlite::Result<CreateChunkedTaskResult> {
+    ensure_chunk_table(conn)?;
+    let task_id = create_ingestion_task(conn, "chunked", input_text)?;
+    let now = now_iso();
+    let mut chunk_ids = Vec::with_capacity(chunk_texts.len());
+
+    for (index, text) in chunk_texts.iter().enumerate() {
+        let chunk_id = new_id();
+        let hash = sha256_hex(text);
+        conn.execute(
+            "INSERT INTO ingestion_chunks
+             (chunk_id, task_id, chunk_index, chunk_text_hash, chunk_text, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+            params![chunk_id, task_id, index as i64, hash, text, now],
+        )?;
+        chunk_ids.push(chunk_id);
+    }
+
+    Ok(CreateChunkedTaskResult { task_id, chunk_ids })
+}
+
+/// Returns all chunk rows for a task (status + preview, no full text).
+pub fn get_task_chunks(conn: &Connection, task_id: &str) -> rusqlite::Result<Vec<ChunkRow>> {
+    ensure_chunk_table(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, task_id, chunk_index,
+                LENGTH(chunk_text),
+                SUBSTR(chunk_text, 1, 50),
+                status, error_message, created_at, updated_at
+         FROM ingestion_chunks
+         WHERE task_id = ?1
+         ORDER BY chunk_index ASC",
+    )?;
+    let rows = stmt.query_map(params![task_id], |row| {
+        Ok(ChunkRow {
+            chunk_id: row.get(0)?,
+            task_id: row.get(1)?,
+            chunk_index: row.get(2)?,
+            char_count: row.get(3)?,
+            text_preview: row.get(4)?,
+            status: row.get(5)?,
+            error_message: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Returns task list with per-status chunk counts.
+pub fn list_chunked_tasks(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<ChunkStatusSummary>> {
+    ensure_chunk_table(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT
+            t.id,
+            t.created_at,
+            SUBSTR(COALESCE(t.input_text, ''), 1, 40),
+            COUNT(c.chunk_id),
+            SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN c.status = 'running' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN c.status = 'done'    THEN 1 ELSE 0 END),
+            SUM(CASE WHEN c.status = 'failed'  THEN 1 ELSE 0 END)
+         FROM ingestion_task t
+         LEFT JOIN ingestion_chunks c ON c.task_id = t.id
+         WHERE t.task_type = 'chunked'
+         GROUP BY t.id
+         ORDER BY t.created_at DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |row| {
+        Ok(ChunkStatusSummary {
+            task_id: row.get(0)?,
+            task_created_at: row.get(1)?,
+            text_preview: row.get(2)?,
+            total: row.get(3)?,
+            pending: row.get(4)?,
+            running: row.get(5)?,
+            done: row.get(6)?,
+            failed: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Reads a single chunk's text for use in process_chunk.
+pub fn get_chunk_for_processing(
+    conn: &Connection,
+    chunk_id: &str,
+) -> rusqlite::Result<Option<(String, String, String)>> {
+    // Returns (chunk_text, status, task_id)
+    conn.query_row(
+        "SELECT chunk_text, status, task_id FROM ingestion_chunks WHERE chunk_id = ?1",
+        params![chunk_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+/// Atomically advances chunk from pending → running.
+/// Returns true only if the row was in 'pending' state and has been claimed.
+/// Returns false if the row was already running/done/failed (or not found), meaning
+/// the caller must NOT proceed to call the AI.
+pub fn set_chunk_running(conn: &Connection, chunk_id: &str) -> rusqlite::Result<bool> {
+    let now = now_iso();
+    let n = conn.execute(
+        "UPDATE ingestion_chunks SET status = 'running', updated_at = ?1
+         WHERE chunk_id = ?2 AND status = 'pending'",
+        params![now, chunk_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Writes successful result for a chunk.
+pub fn set_chunk_done(
+    conn: &Connection,
+    chunk_id: &str,
+    result_json: &str,
+) -> rusqlite::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "UPDATE ingestion_chunks
+         SET status = 'done', result_json = ?1, error_message = NULL, updated_at = ?2
+         WHERE chunk_id = ?3",
+        params![result_json, now, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// Writes failure for a chunk.
+pub fn set_chunk_failed(
+    conn: &Connection,
+    chunk_id: &str,
+    error_message: &str,
+) -> rusqlite::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "UPDATE ingestion_chunks
+         SET status = 'failed', error_message = ?1, updated_at = ?2
+         WHERE chunk_id = ?3",
+        params![error_message, now, chunk_id],
+    )?;
+    Ok(())
+}
+
+// ─── internal helpers ─────────────────────────────────────────────────────────
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
 }

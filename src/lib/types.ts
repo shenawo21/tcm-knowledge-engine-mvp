@@ -117,3 +117,31 @@ export interface UsageSummary {
   totalCalls: number;
   cacheHitCount: number;
 }
+
+export interface ChunkRow {
+  chunkId: string;
+  taskId: string;
+  chunkIndex: number;
+  charCount: number;
+  textPreview: string;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  errorMessage: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface ChunkStatusSummary {
+  taskId: string;
+  taskCreatedAt: string | null;
+  textPreview: string;
+  total: number;
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+}
+
+export interface CreateChunkedTaskResult {
+  taskId: string;
+  chunkIds: string[];
+}

@@ -262,8 +262,7 @@ async fn make_ai_request(
     if finish_reason == "length" {
         return Ok(AiCallOutcome {
             result: Err(
-                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。"
-                    .to_string(),
+                "AI 输出达到 max_tokens 限制，JSON 可能被截断。请缩短输入或稍后重试。".to_string(),
             ),
             input_tokens,
             output_tokens,
@@ -277,7 +276,11 @@ async fn make_ai_request(
         Ok(r) => r,
         Err(e) => {
             let preview: String = content.chars().take(500).collect();
-            let suffix = if content.chars().count() > 500 { "…（已截断）" } else { "" };
+            let suffix = if content.chars().count() > 500 {
+                "…（已截断）"
+            } else {
+                ""
+            };
             return Ok(AiCallOutcome {
                 result: Err(format!(
                     "解析 AI 输出 JSON 失败: {e}\n预览（前500字符）:\n{preview}{suffix}"
@@ -288,5 +291,9 @@ async fn make_ai_request(
         }
     };
 
-    Ok(AiCallOutcome { result: Ok(result), input_tokens, output_tokens })
+    Ok(AiCallOutcome {
+        result: Ok(result),
+        input_tokens,
+        output_tokens,
+    })
 }

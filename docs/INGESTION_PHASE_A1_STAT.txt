@@ -1,0 +1,7 @@
+ src-tauri/src/ai_processor.rs |  15 ++-
+ src-tauri/src/commands.rs     | 238 ++++++++++++++++++++++++++++++++++++++++--
+ src-tauri/src/lib.rs          |   4 +
+ src-tauri/src/models.rs       |  38 +++++++
+ src-tauri/src/repository.rs   | 207 +++++++++++++++++++++++++++++++++---
+ src/lib/types.ts              |  28 +++++
+ 6 files changed, 507 insertions(+), 23 deletions(-)
