@@ -86,6 +86,18 @@
 
 ---
 
+## Git Checkpoint（验证通过后执行）
+
+```bash
+git add .
+git commit -m "feat: add AI cost tracking and exact cache"
+```
+
+> 注：截至 2026-04-28，上述 commit 已由 CI 流程自动完成（`9d279b4`）。
+> 若本地有后续文档变更，可单独提交：`git add docs/ && git commit -m "docs: stage2 validation checklist"`
+
+---
+
 ## 失败处理原则
 
 - 遇到错误：截图 → 记录 → 停止，不要反复重试消耗预算
