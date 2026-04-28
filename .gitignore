@@ -21,3 +21,5 @@ src-tauri/gen/
 Thumbs.db
 
 .claude/settings.local.json
+litellm/config.yaml
+litellm/.env
