@@ -8,6 +8,8 @@ use crate::models::{
 };
 use crate::repository;
 
+const MAX_INPUT_TEXT_CHARS: usize = 10_000;
+
 fn lock_err(e: impl std::fmt::Display) -> String {
     format!("db lock poisoned: {e}")
 }
@@ -31,6 +33,9 @@ pub fn create_ingestion_task(
     if trimmed.is_empty() {
         return Err("input_text is empty".into());
     }
+    if trimmed.chars().count() > MAX_INPUT_TEXT_CHARS {
+        return Err(format!("input_text exceeds {MAX_INPUT_TEXT_CHARS} characters").into());
+    }
     let kind = task_type.unwrap_or_else(|| "text".into());
     let conn = state.db.lock().map_err(lock_err)?;
     repository::create_ingestion_task(&conn, &kind, trimmed).map_err(db_err)
@@ -49,6 +54,9 @@ pub fn save_ai_result(
     let trimmed_input = input_text.trim();
     if trimmed_input.is_empty() {
         return Err("input_text is empty".into());
+    }
+    if trimmed_input.chars().count() > MAX_INPUT_TEXT_CHARS {
+        return Err(format!("input_text exceeds {MAX_INPUT_TEXT_CHARS} characters").into());
     }
     let mut conn = state.db.lock().map_err(lock_err)?;
     match repository::save_ai_result(&mut conn, &task_id, &ai_output, trimmed_input) {
@@ -100,6 +108,9 @@ pub async fn process_with_ai(
     let trimmed = input_text.trim().to_string();
     if trimmed.is_empty() {
         return Err("input_text is empty".into());
+    }
+    if trimmed.chars().count() > MAX_INPUT_TEXT_CHARS {
+        return Err(format!("input_text exceeds {MAX_INPUT_TEXT_CHARS} characters").into());
     }
     let config_opt = {
         let conn = state.db.lock().map_err(lock_err)?;

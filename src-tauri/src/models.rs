@@ -13,6 +13,10 @@ pub struct AiResult {
     pub review: Option<AiReview>,
 }
 
+/// AiSummary is returned to the frontend for display only — it is NOT persisted to the
+/// database and does NOT generate review_item entries in the current implementation.
+/// If future features use summary fields for knowledge ingestion, UI recommendations, or
+/// any persistent storage, they MUST be routed through human review first.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AiSummary {
     pub one_sentence: Option<String>,

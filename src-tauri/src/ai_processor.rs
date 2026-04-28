@@ -27,7 +27,7 @@ Given a Chinese medicine text, extract entities and relationships and return ONL
     {"from": "entity_name", "relation_type": "treats|contains|indicates|belongs_to|contraindicates", "to": "entity_name", "confidence": 0.0}
   ],
   "western_mapping": [
-    {"tcm": "tcm concept", "western": "western medicine equivalent", "mapping_level": "exact|reasonable_inference|speculative"}
+    {"tcm": "tcm concept", "western": "western medicine equivalent", "mapping_level": "source_fact|reasonable_inference|hypothesis|uncertain"}
   ],
   "review": {
     "level": "A",
@@ -37,7 +37,8 @@ Given a Chinese medicine text, extract entities and relationships and return ONL
 }
 
 Review levels: A = classical source or well-evidenced, B = modern/reasonable, C = uncertain or low-quality source.
-Confidence values must be between 0.0 and 1.0.
+Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reasonably inferred, will be flagged for human review; < 0.50 = uncertain, omit unless significant. Do not fabricate entities or relationships; fewer honest entries are better than more invented ones.
+For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
 Return ONLY valid JSON. No explanation, no markdown wrapping."#;
 
 /// Primary AI processing — DB config takes priority, falls back to env vars.

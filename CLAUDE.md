@@ -14,7 +14,7 @@
 
 | 层 | 技术 |
 |---|---|
-| 前端框架 | React 18 + TypeScript + Vite |
+| 前端框架 | React 19 + TypeScript + Vite |
 | 桌面壳 | Tauri 2（Rust 后端） |
 | 本地数据库 | SQLite（通过 Tauri Rust 命令访问） |
 | 前后端通信 | `@tauri-apps/api` `invoke()` IPC |
