@@ -1,0 +1,83 @@
+diff --git a/src-tauri/src/ai_processor.rs b/src-tauri/src/ai_processor.rs
+index a87d552..2556576 100644
+--- a/src-tauri/src/ai_processor.rs
++++ b/src-tauri/src/ai_processor.rs
+@@ -10,40 +10,32 @@ use crate::models::{AiCallOutcome, AiModelConfigRow, AiResult, TestConnectionRes
+ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+ const DEFAULT_MODEL: &str = "gpt-4o-mini";
+ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+-const MAX_TOKENS: u32 = 1800;
+-pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V2";
+-
+-const SYSTEM_PROMPT: &str = r#"You are a TCM (Traditional Chinese Medicine) knowledge extraction assistant.
+-Given a Chinese medicine text, extract entities and relationships and return ONLY a JSON object with this exact structure (no markdown, no code blocks):
+-
+-{
+-  "content_type": "tcm_material",
+-  "summary": {
+-    "one_sentence": "one-sentence summary of the text",
+-    "key_points": ["key point 1", "key point 2"],
+-    "learning_value": "learning value assessment"
+-  },
+-  "entities": [
+-    {"type": "formula|herb|syndrome|symptom|pattern|treatment|concept", "name": "entity name", "confidence": 0.0}
+-  ],
+-  "relations": [
+-    {"from": "entity_name", "relation_type": "treats|contains|indicates|belongs_to|contraindicates", "to": "entity_name", "confidence": 0.0}
+-  ],
+-  "western_mapping": [
+-    {"tcm": "tcm concept", "western": "western medicine equivalent", "mapping_level": "source_fact|reasonable_inference|hypothesis|uncertain"}
+-  ],
+-  "review": {
+-    "level": "A",
+-    "decision": "direct_import|import_with_label|hold_for_review",
+-    "reason": "brief justification"
+-  }
+-}
++const MAX_TOKENS: u32 = 2400;
++pub const PROMPT_VERSION: &str = "TCM_STRUCTURER_V3";
++
++const SYSTEM_PROMPT: &str = r#"You are a TCM knowledge extraction assistant operating in COMPACT MODE.
++Output ONLY a single valid JSON object. No markdown, no code fences, no explanation, no trailing text.
++
++JSON structure (all fields required):
++{"content_type":"tcm_material","summary":{"one_sentence":"≤60 Chinese chars","key_points":["≤3 items"],"learning_value":"≤80 Chinese chars"},"entities":[{"type":"formula|herb|syndrome|symptom|pattern|treatment|concept","name":"≤16 chars","confidence":0.0}],"relations":[{"from":"≤16 chars","relation_type":"treats|contains|indicates|belongs_to|contraindicates","to":"≤16 chars","confidence":0.0}],"western_mapping":[{"tcm":"tcm concept","western":"western equivalent","mapping_level":"source_fact|reasonable_inference|hypothesis|uncertain"}],"review":{"level":"A","decision":"direct_import|import_with_label|hold_for_review","reason":"brief"}}
++
++HARD LIMITS — drop least-important items if needed, never truncate JSON:
++- entities: ≤ 12 (priority: disease-name > syndrome > core-pathomechanism > treatment-principle > formula > herb > symptom)
++- relations: ≤ 8 (priority: pathomechanism→syndrome, syndrome→treatment, symptom→syndrome)
++- key_points: ≤ 3
++- western_mapping: ≤ 3
++
++SELECTION RULES:
++- Keep only the most diagnostically decisive symptoms; omit enumerated lists of similar symptoms.
++- If a concept appears at both superclass and subclass level, keep only the subclass.
++- Do not extract duplicate or near-synonym entities.
++- Omit secondary or illustrative relations; keep only the core causal/therapeutic chain.
++
++CONFIDENCE: ≥0.85 = explicitly stated; 0.50–0.84 = reasonably inferred (flagged for review); <0.50 = omit.
++WESTERN MAPPING: source_fact = text explicitly states equivalence; reasonable_inference = well-accepted; hypothesis = speculative; uncertain = no basis. Never invent mechanisms.
++REVIEW LEVELS: A = classical/well-evidenced; B = modern/reasonable; C = uncertain.
+ 
+-Review levels: A = classical source or well-evidenced, B = modern/reasonable, C = uncertain or low-quality source.
+-Confidence scale: >= 0.85 = directly stated in source text; 0.50–0.84 = reasonably inferred, will be flagged for human review; < 0.50 = uncertain, omit unless significant. Do not fabricate entities or relationships; fewer honest entries are better than more invented ones.
+-For western_mapping: use "source_fact" only when the source text explicitly states the biomedical equivalence; use "reasonable_inference" for well-accepted cross-system mappings; use "hypothesis" for speculative or emerging connections; use "uncertain" when there is no clear basis. Never invent biomedical mechanisms not present or clearly implied by the source text. All western_mapping entries will be flagged for human review regardless of mapping_level.
+-STRICT OUTPUT LIMITS (prioritise the most important items to stay within token budget): entities ≤ 20, relations ≤ 20, western_mapping ≤ 5, key_points ≤ 5. The JSON must be complete and valid — no trailing commas, no truncation, no ellipsis. If you cannot fit all items, drop the least important ones entirely.
+-Return ONLY valid JSON. No explanation, no markdown, no code fences."#;
++The JSON must be syntactically complete and valid. If token budget is tight, drop entire array items — never truncate a string mid-character."#;
+ 
+ pub fn normalize_input(s: &str) -> String {
+     s.split_whitespace().collect::<Vec<_>>().join(" ")
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index e14eaee..5627685 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -187,7 +187,7 @@ pub async fn process_with_ai(
+                 ai_processor::PROMPT_VERSION,
+                 pt,
+                 &api_type_str,
+-                1800,
++                2400,
+                 &model_name,
+                 &json,
+                 input_tokens,

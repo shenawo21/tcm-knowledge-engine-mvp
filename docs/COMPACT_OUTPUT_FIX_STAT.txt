@@ -1,0 +1,3 @@
+ src-tauri/src/ai_processor.rs | 58 +++++++++++++++++++------------------------
+ src-tauri/src/commands.rs     |  2 +-
+ 2 files changed, 26 insertions(+), 34 deletions(-)

@@ -187,7 +187,7 @@ pub async fn process_with_ai(
                 ai_processor::PROMPT_VERSION,
                 pt,
                 &api_type_str,
-                1800,
+                2400,
                 &model_name,
                 &json,
                 input_tokens,
